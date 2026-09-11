@@ -1,9 +1,8 @@
 from datetime import datetime
-from langchain_core.tools import tool
+from langchain.tools import tool, BaseTool
 from typing import List, Any, Optional, Dict
 import os
-from langchain_core.messages import ToolMessage, AIMessage
-from langchain_core.tools import BaseTool
+from langchain.messages import ToolMessage, AIMessage
 from src.deep_research_agent.configuration import Configuration
 
 async def get_all_tools(config):

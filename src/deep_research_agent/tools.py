@@ -2,7 +2,7 @@ import json
 from typing import Any, Dict, List, Optional
 
 from langchain_core.documents import Document
-from langchain_core.tools import tool
+from langchain.tools import tool
 from pydantic import BaseModel, Field
 
 from src.database.chroma_manager import query_segments, query_summaries

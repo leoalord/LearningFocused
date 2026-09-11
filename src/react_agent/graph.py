@@ -7,7 +7,7 @@ Purpose:
 Key Components:
     - create_agent: LangChain helper for an agent runtime (built on LangGraph)
     - Tools: Imported from shared tools module (Chroma, Neo4j)
-    - Model: Configurable LLM (default: gpt-5-mini for speed/cost)
+    - Model: Configurable LLM (default: gemini-flash-latest)
     - Checkpointer: MemorySaver for conversation persistence within a session
     
 Usage:
@@ -20,7 +20,7 @@ Usage:
 
 from typing import Any, Optional
 from langchain.agents import create_agent
-from langchain_core.messages import HumanMessage
+from langchain.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import MemorySaver
 

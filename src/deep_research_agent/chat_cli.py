@@ -15,7 +15,8 @@ import asyncio
 from typing import List, Any, cast
 
 from dotenv import load_dotenv
-from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
+from langchain.messages import HumanMessage, AIMessage
+from langchain_core.messages import BaseMessage
 
 from src.deep_research_agent.graph import deep_researcher
 

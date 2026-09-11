@@ -1,7 +1,7 @@
 import operator
 from typing import Annotated, List, TypedDict, Optional, Literal, Union, Dict, Any
 from pydantic import BaseModel, Field
-from langchain_core.messages import AnyMessage
+from langchain.messages import AnyMessage
 
 class ResearchTopic(BaseModel):
     topic: str = Field(description="The specific sub-topic or question to research")

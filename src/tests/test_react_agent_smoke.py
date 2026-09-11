@@ -47,4 +47,16 @@ class TestReactAgentModelCreation(unittest.TestCase):
         with self.assertRaises(ValueError):
             create_chat_model("gpt-5.1-mini")
 
+    def test_graph_imports_without_error(self) -> None:
+        from src.react_agent.graph import get_react_agent, react_agent
+
+        self.assertIsNotNone(react_agent)
+        self.assertTrue(callable(get_react_agent))
+
+    def test_default_model_is_gemini_flash_latest(self) -> None:
+        from src.react_agent.configuration import DEFAULT_MODEL, Configuration
+
+        self.assertEqual(DEFAULT_MODEL, "gemini-flash-latest")
+        self.assertEqual(Configuration().model, "gemini-flash-latest")
+
 

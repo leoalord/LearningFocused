@@ -191,8 +191,7 @@ def create_chat_model(
             kwargs["max_tokens"] = max_tokens
         if timeout is not None:
             kwargs["timeout"] = timeout
-        # langchain_anthropic uses `model_name=...` in this repo
-        return ChatAnthropic(model_name=canonical_name, **kwargs)  # type: ignore[call-arg]
+        return ChatAnthropic(model=canonical_name, **kwargs)  # type: ignore[call-arg]
 
     if provider == "fireworks":
         if temperature is not None:

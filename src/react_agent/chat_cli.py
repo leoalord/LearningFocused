@@ -20,7 +20,8 @@ import uuid
 from typing import Any, Sequence, Union
 
 from dotenv import load_dotenv
-from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, ToolMessage
+from langchain.messages import HumanMessage, AIMessage, ToolMessage
+from langchain_core.messages import BaseMessage
 from langgraph.errors import GraphRecursionError
 from langchain_core.runnables import RunnableConfig
 
