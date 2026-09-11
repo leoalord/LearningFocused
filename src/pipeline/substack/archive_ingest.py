@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode, urlparse
 
@@ -31,15 +32,27 @@ from src.pipeline.substack.download_articles import (
 )
 
 
+_BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+)
+
+
 def _get_session() -> requests.Session:
     """Create a requests session with basic retries (same pattern as audio pipeline)."""
     session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": _BROWSER_UA,
+            "Accept": "application/json, text/html;q=0.9,*/*;q=0.8",
+        }
+    )
     retry = Retry(
         total=3,
         read=3,
         connect=3,
         backoff_factor=1,
-        status_forcelist=[500, 502, 503, 504],
+        status_forcelist=[429, 500, 502, 503, 504],
     )
     adapter = HTTPAdapter(max_retries=retry)
     session.mount("http://", adapter)
@@ -82,6 +95,40 @@ def _extract_candidate_from_item(item: dict[str, Any]) -> tuple[str | None, str 
         str(title) if title else None,
         str(raw_html) if raw_html else None,
     )
+
+
+def _slug_from_canonical_url(canonical_url: str) -> str:
+    return Path(urlparse(canonical_url).path).name
+
+
+def _fetch_post_html(
+    session: requests.Session,
+    *,
+    base_url: str,
+    canonical_url: str,
+    slug: str | None = None,
+) -> str | None:
+    """Prefer the unofficial post JSON API (includes body_html); fall back to the HTML page."""
+    slug = slug or _slug_from_canonical_url(canonical_url)
+    if slug:
+        try:
+            resp = session.get(f"{base_url}/api/v1/posts/{slug}", timeout=20)
+            ctype = (resp.headers.get("content-type") or "").lower()
+            if resp.ok and "json" in ctype:
+                data = resp.json()
+                if isinstance(data, dict):
+                    html = data.get("body_html") or data.get("post_html") or data.get("html")
+                    if html:
+                        return str(html)
+        except Exception:
+            pass
+
+    try:
+        resp = session.get(canonical_url, timeout=20)
+        resp.raise_for_status()
+        return resp.text
+    except Exception:
+        return None
 
 
 def _extract_urls_from_archive_html(html: str, *, base_url: str) -> list[str]:
@@ -176,11 +223,13 @@ def ingest_substack_archive(
             doc_id = doc_id_from_canonical_url(canonical_url)
 
             if (not raw_html) and fetch_full_html:
-                try:
-                    r = session.get(canonical_url, timeout=20)
-                    r.raise_for_status()
-                    raw_html = r.text
-                except Exception:
+                raw_html = _fetch_post_html(
+                    session,
+                    base_url=base_url,
+                    canonical_url=canonical_url,
+                    slug=item.get("slug") if isinstance(item.get("slug"), str) else None,
+                )
+                if not raw_html:
                     results.append(
                         IngestResult(
                             status="failed",
@@ -248,12 +297,16 @@ def ingest_substack_archive(
         canonical_url = canonicalize_url(url)
         doc_id = doc_id_from_canonical_url(canonical_url)
 
-        try:
-            r = session.get(canonical_url, timeout=20)
-            r.raise_for_status()
-            raw_html = r.text
-        except Exception:
-            results.append(IngestResult(status="failed", doc_id=doc_id, canonical_url=canonical_url, reason="Fetch post HTML failed"))
+        raw_html = _fetch_post_html(session, base_url=base_url, canonical_url=canonical_url)
+        if not raw_html:
+            results.append(
+                IngestResult(
+                    status="failed",
+                    doc_id=doc_id,
+                    canonical_url=canonical_url,
+                    reason="Fetch post HTML failed",
+                )
+            )
             continue
 
         text = html_to_markdownish_text(raw_html)

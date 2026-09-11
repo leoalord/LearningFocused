@@ -1,7 +1,9 @@
 import json
 import os
+import re
+from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from dotenv import load_dotenv
 from langchain_core.output_parsers import PydanticOutputParser
@@ -70,35 +72,171 @@ def load_metadata(file_path: Path) -> Dict[str, Any]:
         return json.load(f)
 
 
-def group_episodes(filenames: List[str], metadata_dir: Path) -> List[EpisodeGroup]:
-    print("Grouping episodes based on filenames and metadata...")
+# Gemini 504'd when grouping ~332 filenames in one call. Keep batches in this range.
+GROUPING_BATCH_SIZE = 60
+GROUPING_BATCH_OVERLAP = 8
+_EPISODE_RE = re.compile(r"S(\d+)E(\d+)", re.IGNORECASE)
 
-    episodes_context = []
-    for fname in filenames:
-        meta_path = metadata_dir / fname
-        meta = load_metadata(meta_path)
-        episodes_context.append(
-            {
-                "filename": fname,
-                "title": meta.get("title", fname),
-                "summary": (
-                    meta.get("summary", "")[:200] + "..." if meta.get("summary") else "No summary"
-                ),
-                "published": meta.get("published", "Unknown date"),
-                "episode_number": meta.get("itunes_episode", "Unknown"),
-            }
+
+def episode_sort_key(filename: str) -> tuple[int, int, int, str]:
+    """Sort numbered episodes (S2E290) before unnumbered titles, then by season/episode."""
+    match = _EPISODE_RE.search(filename)
+    if match:
+        return (0, int(match.group(1)), int(match.group(2)), filename.lower())
+    return (1, 0, 0, filename.lower())
+
+
+def iter_grouping_batches(
+    filenames: Sequence[str],
+    batch_size: int = GROUPING_BATCH_SIZE,
+    overlap: int = GROUPING_BATCH_OVERLAP,
+) -> List[List[str]]:
+    """Split a sorted filename list into overlapping windows.
+
+    Overlap at batch boundaries lets Part 1 / Part 2 series that straddle a cut
+    still be grouped together, then merge_and_dedupe_groups assigns each file once.
+    """
+    if batch_size < 1:
+        raise ValueError("batch_size must be >= 1")
+    if overlap < 0:
+        raise ValueError("overlap must be >= 0")
+    if overlap >= batch_size:
+        raise ValueError("overlap must be smaller than batch_size")
+
+    ordered = list(filenames)
+    n = len(ordered)
+    if n == 0:
+        return []
+    if n <= batch_size:
+        return [ordered]
+
+    step = batch_size - overlap
+    batches: List[List[str]] = []
+    start = 0
+    while True:
+        end = min(start + batch_size, n)
+        batches.append(ordered[start:end])
+        if end >= n:
+            break
+        start += step
+    return batches
+
+
+def _is_grouping_timeout(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    tokens = (
+        "504",
+        "timeout",
+        "timed out",
+        "deadline",
+        "deadline exceeded",
+        "gateway timeout",
+    )
+    return any(token in text for token in tokens)
+
+
+def _unique_preserve_order(items: Sequence[str]) -> List[str]:
+    seen: set[str] = set()
+    unique: List[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        unique.append(item)
+    return unique
+
+
+def merge_and_dedupe_groups(
+    filenames: Sequence[str],
+    groups: Sequence[EpisodeGroup],
+) -> List[EpisodeGroup]:
+    """Union groups that share filenames (batch-boundary overlap), then assign each file once."""
+    allowed = set(filenames)
+    parent: dict[str, str] = {name: name for name in filenames}
+
+    def find(name: str) -> str:
+        while parent[name] != name:
+            parent[name] = parent[parent[name]]
+            name = parent[name]
+        return name
+
+    def union(left: str, right: str) -> None:
+        root_left, root_right = find(left), find(right)
+        if root_left != root_right:
+            parent[root_right] = root_left
+
+    contributing: List[EpisodeGroup] = []
+    for group in groups:
+        valid = _unique_preserve_order([name for name in group.filenames if name in allowed])
+        if not valid:
+            continue
+        for left, right in zip(valid, valid[1:]):
+            union(left, right)
+        contributing.append(
+            EpisodeGroup(group_id=group.group_id, filenames=valid, reasoning=group.reasoning)
         )
 
-    llm = get_grouping_llm(temperature=0.0)
+    components: dict[str, List[str]] = defaultdict(list)
+    for name in filenames:
+        components[find(name)].append(name)
 
+    groups_by_root: dict[str, List[EpisodeGroup]] = defaultdict(list)
+    for group in contributing:
+        groups_by_root[find(group.filenames[0])].append(group)
+
+    merged: List[EpisodeGroup] = []
+    used_ids: set[str] = set()
+    for root, names in components.items():
+        unique_names = _unique_preserve_order(names)
+        related = groups_by_root.get(root, [])
+        if related:
+            multi = [g for g in related if len(g.filenames) > 1]
+            pick = (multi or related)[0]
+            group_id = pick.group_id
+            extras = [g.group_id for g in related if g.group_id != pick.group_id]
+            reasoning = pick.reasoning
+            if extras:
+                reasoning = f"{reasoning} (merged overlapping batch groups: {', '.join(extras)})"
+        else:
+            group_id = unique_names[0]
+            reasoning = "Ungrouped leftover from batched grouping; assigned as a singleton."
+
+        original_id = group_id
+        suffix = 2
+        while group_id in used_ids:
+            group_id = f"{original_id}-{suffix}"
+            suffix += 1
+        used_ids.add(group_id)
+        merged.append(EpisodeGroup(group_id=group_id, filenames=unique_names, reasoning=reasoning))
+
+    merged.sort(key=lambda group: episode_sort_key(group.filenames[0] if group.filenames else group.group_id))
+    return merged
+
+
+def _build_episode_context(fname: str, metadata_dir: Path) -> Dict[str, Any]:
+    meta = load_metadata(metadata_dir / fname)
+    return {
+        "filename": fname,
+        "title": meta.get("title", fname),
+        "summary": (
+            meta.get("summary", "")[:200] + "..." if meta.get("summary") else "No summary"
+        ),
+        "published": meta.get("published", "Unknown date"),
+        "episode_number": meta.get("itunes_episode", "Unknown"),
+    }
+
+
+def _group_single_batch(episodes_context: List[Dict[str, Any]], llm: Any) -> List[EpisodeGroup]:
+    """Group one batch of episode metadata via get_grouping_llm. Do not send the full catalog."""
     parser = PydanticOutputParser(pydantic_object=GroupingResponse)
-
     prompt = ChatPromptTemplate.from_messages(
         [
             (
                 "system",
                 """You are an expert content librarian.
 Your task is to group podcast episodes that belong to the same multi-part series or specific topic conversation.
+
+This list is one contiguous batch from a larger catalog. Group only among these episodes.
 
 Guidelines:
 1. Analyze the provided list of episodes, including their filenames, titles, summaries, and publication dates.
@@ -107,6 +245,7 @@ Guidelines:
 4. Episodes that are standalone interviews or topics should be in their own single-episode group.
 5. Every provided filename MUST be assigned to exactly one group.
 6. Create a descriptive group_id for each group.
+7. Do not invent filenames that are not in the list.
 
 {format_instructions}
 """,
@@ -114,23 +253,60 @@ Guidelines:
             ("user", "Episode List:\n{episodes_json}"),
         ]
     )
-
     chain = prompt | llm | parser
-
+    batch_filenames = [item["filename"] for item in episodes_context]
     try:
-        episodes_json_str = json.dumps(episodes_context, indent=2)
         result = chain.invoke(
             {
-                "episodes_json": episodes_json_str,
+                "episodes_json": json.dumps(episodes_context, indent=2),
                 "format_instructions": parser.get_format_instructions(),
             }
         )
         return result.groups
     except Exception as e:
-        print(f"Error grouping episodes: {e}")
+        if _is_grouping_timeout(e):
+            print(f"Error grouping episode batch ({len(batch_filenames)} files): {e}")
+            raise
+        print(f"Error grouping episode batch ({len(batch_filenames)} files): {e}")
         return [
-            EpisodeGroup(group_id=f, filenames=[f], reasoning="Fallback error") for f in filenames
+            EpisodeGroup(group_id=f, filenames=[f], reasoning="Fallback error")
+            for f in batch_filenames
         ]
+
+
+def group_episodes(
+    filenames: List[str],
+    metadata_dir: Path,
+    *,
+    batch_size: int = GROUPING_BATCH_SIZE,
+    overlap: int = GROUPING_BATCH_OVERLAP,
+) -> List[EpisodeGroup]:
+    print("Grouping episodes based on filenames and metadata...")
+    if not filenames:
+        return []
+
+    ordered = sorted(filenames, key=episode_sort_key)
+    batches = iter_grouping_batches(ordered, batch_size=batch_size, overlap=overlap)
+    print(
+        f"Grouping {len(ordered)} episodes in {len(batches)} batches "
+        f"(batch_size={batch_size}, overlap={overlap})."
+    )
+
+    llm = get_grouping_llm(temperature=0.0)
+    batch_groups: List[EpisodeGroup] = []
+    for i, batch in enumerate(batches, start=1):
+        print(f"  Grouping batch {i}/{len(batches)} ({len(batch)} episodes)...")
+        context = [_build_episode_context(fname, metadata_dir) for fname in batch]
+        batch_groups.extend(_group_single_batch(episodes_context=context, llm=llm))
+
+    merged = merge_and_dedupe_groups(ordered, batch_groups)
+    assigned = [name for group in merged for name in group.filenames]
+    if sorted(assigned) != sorted(ordered):
+        raise RuntimeError(
+            "Batched grouping failed uniqueness check: every filename must appear in exactly one group."
+        )
+    print(f"Merged to {len(merged)} groups after overlap dedupe.")
+    return merged
 
 
 def generate_combined_summary(

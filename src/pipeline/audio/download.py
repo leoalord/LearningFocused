@@ -104,15 +104,22 @@ def download_podcasts(
     print(f"Found {len(feed.entries)} episodes.")
 
     session = get_session()
-    entries_to_download = feed.entries
+    downloaded = 0
+    skipped_existing = 0
+    failed = 0
 
+    # `limit` is a cap on NEW downloads, not how many RSS entries to scan.
+    # After a long gap that matters: the feed is newest-first, but skipping
+    # existing files is cheap, so we walk the whole feed until the cap is hit.
     if limit is not None:
-        entries_to_download = feed.entries[:limit]
-        print(f"Limiting to the most recent {len(entries_to_download)} episodes for testing...")
+        print(f"Scanning full feed; will download at most {limit} new episode(s).")
     else:
-        print("Processing all episodes...")
+        print("Processing all episodes (skipping files that already exist)...")
 
-    for entry in entries_to_download:
+    for entry in feed.entries:
+        if limit is not None and downloaded >= limit:
+            print(f"Reached new-download limit ({limit}).")
+            break
         try:
             title = entry.title
             clean_title = sanitize_filename(title)
@@ -125,10 +132,9 @@ def download_podcasts(
 
             with open(metadata_filepath, "w", encoding="utf-8") as f:
                 json.dump(metadata, f, indent=2, ensure_ascii=False)
-            print(f"Saved metadata: {metadata_filename}")
 
             if os.path.exists(filepath):
-                print(f"Skipping (already exists): {filename}")
+                skipped_existing += 1
                 continue
 
             audio_url = None
@@ -146,6 +152,7 @@ def download_podcasts(
 
             if not audio_url:
                 print(f"No audio link found for: {title}")
+                failed += 1
                 continue
 
             print(f"Downloading: {filename}")
@@ -156,13 +163,18 @@ def download_podcasts(
                 for chunk in response.iter_content(chunk_size=8192):
                     f.write(chunk)
 
+            downloaded += 1
             time.sleep(1)
 
         except Exception as e:
+            failed += 1
             print(f"Error downloading '{entry.get('title', 'Unknown')}': {e}")
             continue
 
-    print("Download process completed.")
+    print(
+        "Download process completed. "
+        f"new={downloaded} skipped_existing={skipped_existing} failed={failed}"
+    )
 
 
 def main() -> None:

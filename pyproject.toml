@@ -27,6 +27,9 @@ dependencies = [
     "matplotlib>=3.10.8",
     "umap-learn>=0.5.9.post2",
     "pytest>=9.0.2",
+    "langgraph-checkpoint-sqlite>=3.1.1",
+    "fastapi>=0.141.1",
+    "uvicorn>=0.38.0",
 ]
 
 [dependency-groups]

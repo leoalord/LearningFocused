@@ -180,6 +180,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 reset=args.reset_chroma,
                 include_audio=True,
                 include_articles=False,
+                include_youtube=False,
                 confirm_reset=args.confirm_reset_chroma,
             )
 

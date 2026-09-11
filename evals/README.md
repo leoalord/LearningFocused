@@ -1,6 +1,6 @@
 # Retrieval gold set
 
-Gold questions for later retrieval scoring (TASK-11). This directory is the gold set + schema only — it is not an eval runner.
+Gold questions plus a read-only retrieval eval runner (TASK-11).
 
 Corpus: Future of Education podcast (Alpha School / Two Hour Learning) plus the Future of Education Substack. Questions were grounded in on-disk artifacts (`metadata_output/`, `segmented_transcripts/`, `substack_articles/`, `article_summaries/`), not invented episode numbers.
 
@@ -10,6 +10,10 @@ Corpus: Future of Education podcast (Alpha School / Two Hour Learning) plus the 
 | --- | --- |
 | `gold_questions.json` | Canonical gold set (JSON array, 18 items) |
 | `schema.example.json` | One-item copy of the schema for a later agent to copy |
+| `run.py` | Read-only eval runner (`uv run python -m evals.run`) |
+| `scoring.py` | Hit definition + miss classification helpers |
+| `last_report.json` | Latest run output (overwritten each run; keep committed as the sample) |
+| `last_report.example.json` | Tiny committed copy of the report shape |
 
 ## Item schema
 
@@ -38,6 +42,47 @@ TASK-11 (or any later eval runner) should score **retrieval**, not free-form LLM
 Primary metric: hit-rate = hits / 18. Report 2026 vs Substack slices if useful.
 
 Do not treat `source_hint` as a required metadata match for the official hit. Metadata naming differs across stores (segment `episode_id` vs Substack `doc_id`), so phrase containment is the stable contract.
+
+## Eval runner (TASK-11)
+
+Requires an existing on-disk Chroma store (`chroma_db/`) and embedding credentials in `.env`. The runner **does not** `--reset-chroma`, does not add documents, and does not run ingest pipelines.
+
+```bash
+uv run python -m evals.run
+```
+
+Optional flags: `--gold`, `--report`, `--max-segments` (default 5), `--max-summaries` (default 3). Defaults match `search_knowledge_base` (`query_summaries` then `query_segments`).
+
+Stdout prints `N`, hit rate, missed ids, miss split, and each failed question (not only a percentage). JSON is written to `evals/last_report.json`.
+
+Hit scoring is the contract above: concatenated retrieved `page_content`, case-fold, every `must_include` substring. `source_hint` is not used to score.
+
+Miss types (analysis only; does not change the hit/miss label):
+
+| `miss_type` | Meaning |
+| --- | --- |
+| `not_in_corpus` | Hinted source artifact missing on disk, or present but not indexed in Chroma. |
+| `retriever_failed` | Hinted source is indexed (or phrases exist in that retrievable source) but top-k did not surface every `must_include` phrase. |
+
+Scoring unit tests (no Chroma):
+
+```bash
+uv run pytest evals/test_scoring.py
+```
+
+### Report shape
+
+`evals/last_report.json` (see also `last_report.example.json`) is an object with:
+
+| Field | Meaning |
+| --- | --- |
+| `n`, `hits`, `hit_rate` | Official metrics (`hit_rate = hits / n`) |
+| `missed_ids` | Failed question ids (empty list if none) |
+| `miss_split` | Counts for `not_in_corpus` and `retriever_failed` |
+| `slices` | `2026_podcast` / `substack` / `earlier_podcast` |
+| `questions[]` | Per-item `hit`, `missing_phrases`, `miss_type`, `corpus` diagnostics |
+
+The report stores titles and ids, not full retrieved text, so it stays small enough to commit.
 
 ## Mix in this set
 

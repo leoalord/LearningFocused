@@ -69,16 +69,32 @@ def _doc_to_source_chunk(doc: Document, *, snippet_limit: int = 900) -> SourceCh
         metadata=meta_clean,
     )
 
+def _format_youtube_hit(doc: Document) -> str:
+    """Format a YouTube Chroma hit using title + URL (never the podcast 'Episode' label)."""
+    title = doc.metadata.get("title", "Unknown YouTube video")
+    url = doc.metadata.get("canonical_url") or doc.metadata.get("url")
+    doc_type = doc.metadata.get("type", "unknown")
+    topic = doc.metadata.get("topic")
+    lines = [f"YouTube: {title}", f"Type: {doc_type}"]
+    if url:
+        lines.append(f"URL: {url}")
+    if topic:
+        lines.append(f"Topic: {topic}")
+    lines.append(f"Content: {doc.page_content}")
+    return "\n".join(lines) + "\n"
+
+
 @tool
 def search_knowledge_base(query: str, max_segments: int = 5, max_summaries: int = 3) -> str:
     """
-    Search the educational podcast transcripts and summaries for specific information.
+    Search the educational knowledge base (podcast transcripts, Substack articles,
+    and unique YouTube videos/Shorts) for specific information.
     Use this to find quotes, definitions, or discussions on specific topics.
     
     Args:
         query: The search query string.
         max_segments: Maximum number of transcript segments to return (default: 5).
-        max_summaries: Maximum number of episode summaries to return (default: 3).
+        max_summaries: Maximum number of episode/article/YouTube summaries to return (default: 3).
         
     Returns:
         A formatted string of relevant segments and summaries.
@@ -90,10 +106,12 @@ def search_knowledge_base(query: str, max_segments: int = 5, max_summaries: int 
     results = []
     
     if summaries:
-        results.append("=== High-level Summaries (episodes + articles) ===")
+        results.append("=== High-level Summaries (episodes + articles + YouTube) ===")
         for doc in summaries:
             doc_type = doc.metadata.get("type", "unknown")
-            if str(doc_type).startswith("article_"):
+            if str(doc_type).startswith("youtube_"):
+                results.append(_format_youtube_hit(doc))
+            elif str(doc_type).startswith("article_"):
                 title = doc.metadata.get("title", "Unknown Article")
                 results.append(
                     f"Article: {title}\nType: {doc_type}\nURL: {doc.metadata.get('canonical_url')}\nContent: {doc.page_content}\n"
@@ -104,10 +122,12 @@ def search_knowledge_base(query: str, max_segments: int = 5, max_summaries: int 
                 )
     
     if segments:
-        results.append("\n=== Detailed Segments (transcripts + articles) ===")
+        results.append("\n=== Detailed Segments (transcripts + articles + YouTube) ===")
         for doc in segments:
             doc_type = doc.metadata.get("type", "unknown")
-            if doc_type == "article_text":
+            if str(doc_type).startswith("youtube_"):
+                results.append(_format_youtube_hit(doc))
+            elif doc_type == "article_text":
                 results.append(
                     f"Article: {doc.metadata.get('title', 'Unknown')}\nContent: {doc.page_content}\n"
                 )

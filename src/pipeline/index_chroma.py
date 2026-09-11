@@ -27,15 +27,18 @@ COLLECTION_NAME = "education_knowledge_engine"
 # `article_text` + `article_summary_overview`, but cleanup should remove all `article_*` docs.
 SUBSTACK_TYPE_PREFIX = "article_"
 AUDIO_CHROMA_TYPES = ["transcript_segment", "series_overview", "series_motivation", "key_takeaway"]
+YOUTUBE_CHROMA_TYPES = ["youtube_transcript_segment", "youtube_summary_overview"]
 
 DESTRUCTIVE_OPS_ENV = "LEARNINGFOCUSED_ALLOW_DESTRUCTIVE_OPS"
 RESET_CHROMA_CONFIRM_TOKEN = "DELETE_ALL_CHROMA"
 
 
-def delete_substack_from_chroma() -> None:
-    """Delete only Substack-derived documents from Chroma (keeps audio vectors).
+def _delete_by_type(matches_type, label: str) -> int:
+    """Delete documents whose `type` metadata satisfies `matches_type`.
 
-    This is safer than `reset=True`, which wipes the entire persisted collection.
+    Scans ids+metadatas rather than using a server-side filter, which avoids
+    backend-specific filter limitations and also catches legacy type names.
+    Scoped deletion is safer than `reset=True`, which wipes the whole collection.
     """
     ensure_data_dirs()
     embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
@@ -45,8 +48,6 @@ def delete_substack_from_chroma() -> None:
         persist_directory=str(CHROMA_DIR),
     )
 
-    # Robust deletion: scan IDs+metadatas and delete those whose `type` starts with `article_`.
-    # This avoids backend-specific filter limitations and also cleans up older `article_*` types.
     try:
         to_delete: list[str] = []
         offset = 0
@@ -65,15 +66,24 @@ def delete_substack_from_chroma() -> None:
                 if not isinstance(meta, dict):
                     continue
                 t = meta.get("type")
-                if isinstance(t, str) and t.startswith(SUBSTACK_TYPE_PREFIX):
+                if isinstance(t, str) and matches_type(t):
                     to_delete.append(str(_id))
             offset += len(ids)
 
         if to_delete:
             vector_store._collection.delete(ids=to_delete)  # type: ignore[attr-defined]
-        print(f"Deleted {len(to_delete)} Substack documents from Chroma (type startswith '{SUBSTACK_TYPE_PREFIX}').")
+        print(f"Deleted {len(to_delete)} documents from Chroma ({label}).")
+        return len(to_delete)
     except Exception as e:
-        raise RuntimeError(f"Failed to delete Substack docs from Chroma: {e}") from e
+        raise RuntimeError(f"Failed to delete {label} docs from Chroma: {e}") from e
+
+
+def delete_substack_from_chroma() -> None:
+    """Delete only Substack-derived documents from Chroma (keeps audio vectors)."""
+    _delete_by_type(
+        lambda t: t.startswith(SUBSTACK_TYPE_PREFIX),
+        f"type startswith '{SUBSTACK_TYPE_PREFIX}'",
+    )
 
 
 def delete_audio_from_chroma() -> None:
@@ -81,41 +91,28 @@ def delete_audio_from_chroma() -> None:
 
     Useful for one-time cleanup if legacy runs created duplicates before stable IDs.
     """
-    ensure_data_dirs()
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-    vector_store = Chroma(
-        collection_name=COLLECTION_NAME,
-        embedding_function=embeddings,
-        persist_directory=str(CHROMA_DIR),
-    )
-    try:
-        to_delete: list[str] = []
-        offset = 0
-        page_size = 2000
-        audio_types = set(AUDIO_CHROMA_TYPES)
-        while True:
-            data = vector_store._collection.get(  # type: ignore[attr-defined]
-                include=["metadatas"],
-                limit=page_size,
-                offset=offset,
-            )
-            ids = data.get("ids") or []
-            metas = data.get("metadatas") or []
-            if not ids:
-                break
-            for _id, meta in zip(ids, metas):
-                if not isinstance(meta, dict):
-                    continue
-                t = meta.get("type")
-                if isinstance(t, str) and t in audio_types:
-                    to_delete.append(str(_id))
-            offset += len(ids)
+    audio_types = set(AUDIO_CHROMA_TYPES)
+    _delete_by_type(lambda t: t in audio_types, f"types: {AUDIO_CHROMA_TYPES}")
 
-        if to_delete:
-            vector_store._collection.delete(ids=to_delete)  # type: ignore[attr-defined]
-        print(f"Deleted {len(to_delete)} audio documents from Chroma (types: {AUDIO_CHROMA_TYPES}).")
-    except Exception as e:
-        raise RuntimeError(f"Failed to delete audio docs from Chroma: {e}") from e
+
+def delete_transcript_segments_from_chroma() -> int:
+    """Delete only `transcript_segment` docs (keeps podcast summaries, Substack, YouTube).
+
+    Needed when the document id scheme changes: re-indexing writes new ids, so the
+    rows under the old ids would otherwise linger as orphans.
+    """
+    return _delete_by_type(
+        lambda t: t == "transcript_segment", "type: transcript_segment"
+    )
+
+
+def delete_youtube_from_chroma() -> None:
+    """Delete only YouTube-derived documents from Chroma (keeps audio + Substack).
+
+    TASK-5 must not call this during ingest. Upsert youtube_* types only.
+    """
+    youtube_types = set(YOUTUBE_CHROMA_TYPES)
+    _delete_by_type(lambda t: t in youtube_types, f"types: {YOUTUBE_CHROMA_TYPES}")
 
 
 def update_chroma_db(
@@ -123,6 +120,7 @@ def update_chroma_db(
     *,
     include_audio: bool = True,
     include_articles: bool = True,
+    include_youtube: bool = False,
     confirm_reset: str | None = None,
 ) -> None:
     """Update the ChromaDB vector store.
@@ -131,15 +129,17 @@ def update_chroma_db(
         reset: If True, delete the persisted Chroma directory before indexing.
         include_audio: If True, collect/index audio-derived documents.
         include_articles: If True, collect/index Substack-derived documents.
+        include_youtube: If True, collect/index YouTube-derived documents (not folded into audio).
     """
     ensure_data_dirs()
 
     # Pipeline-owned indexers (kept out of DB adapter files)
     from src.pipeline.audio.index_chroma import collect_audio_documents
     from src.pipeline.substack.index_chroma import collect_substack_documents
+    from src.pipeline.youtube.index_chroma import collect_youtube_documents
 
     # Reset semantics: delete the entire ChromaDB directory (local dev).
-    # This is a destructive, global operation (audio + substack). Keep it deliberately hard to run.
+    # This is a destructive, global operation (audio + substack + youtube). Keep it deliberately hard to run.
     if reset and CHROMA_DIR.exists():
         if os.getenv(DESTRUCTIVE_OPS_ENV, "").lower() != "true":
             raise RuntimeError(
@@ -167,6 +167,7 @@ def update_chroma_db(
     all_documents = []
     audio_count = 0
     article_count = 0
+    youtube_count = 0
 
     if include_audio:
         print("Collecting audio documents...")
@@ -189,6 +190,18 @@ def update_chroma_db(
         else:
             print(f"  Found {article_count} article documents")
 
+    if include_youtube:
+        print("Collecting YouTube documents...")
+        youtube_docs = collect_youtube_documents()
+        youtube_count = len(youtube_docs)
+        all_documents.extend(youtube_docs)
+        yt_ids = {
+            d.metadata.get("video_id")
+            for d in youtube_docs
+            if isinstance(d.metadata, dict) and d.metadata.get("video_id")
+        }
+        print(f"  Found {youtube_count} YouTube documents (~{len(yt_ids)} videos)")
+
     if not all_documents:
         print("No documents found to index.")
         return
@@ -207,7 +220,7 @@ def update_chroma_db(
         print(f"  (Sanity Check) Filtered out {dupe_count} duplicate documents from the collection list.")
     
     all_documents = list(unique_docs_by_id.values())
-    print(f"\nPreparing {len(all_documents)} unique documents for ChromaDB (audio: {audio_count}, articles: {article_count})...")
+    print(f"\nPreparing {len(all_documents)} unique documents for ChromaDB (audio: {audio_count}, articles: {article_count}, youtube: {youtube_count})...")
 
     # Extract IDs from metadata for upserts/deduplication.
     # Indexers should provide `_chroma_id`. If any are missing, fail loudly so we don't

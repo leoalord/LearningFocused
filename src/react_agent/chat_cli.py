@@ -6,18 +6,20 @@ Purpose:
 Features:
     - Colored output (ANSI codes)
     - Streams tool calls and final responses
-    - Conversation memory via LangGraph checkpointer (persists within session)
+    - Conversation memory via LangGraph SQLite checkpointer (survives restart)
     - Type 'exit' or Ctrl+C to quit
     
 Usage:
     uv run python -m src.react_agent.chat_cli
+    uv run python -m src.react_agent.chat_cli --thread-id <id>
 """
 
+import argparse
 import sys
 import asyncio
 import os
 import uuid
-from typing import Any, Sequence, Union
+from typing import Any, Optional, Sequence, Union
 
 from dotenv import load_dotenv
 from langchain.messages import HumanMessage, AIMessage, ToolMessage
@@ -25,6 +27,7 @@ from langchain_core.messages import BaseMessage
 from langgraph.errors import GraphRecursionError
 from langchain_core.runnables import RunnableConfig
 
+from src.llm.content import format_message_content
 from src.react_agent.graph import react_agent
 from src.react_agent.configuration import Configuration
 
@@ -45,34 +48,20 @@ def _truncate(text: str, limit: int = 600) -> str:
         return text
     return text[:limit] + " ...[truncated]..."
 
-def _format_ai_content(content: Any) -> str:
-    """Normalize provider-specific message content into a readable string.
+_format_ai_content = format_message_content
 
-    Some providers (notably Gemini) may return content as a list of blocks like:
-      [{"type": "text", "text": "...", "extras": {...}}]
-    We extract the user-visible text and drop huge metadata payloads.
+
+def _first_unseen_index(messages: Sequence[BaseMessage]) -> int:
+    """Index of the first message produced by the current turn.
+
+    Everything up to and including this turn's HumanMessage is either restored
+    checkpoint history or the prompt the user just typed, so none of it should
+    be re-printed as agent output.
     """
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    # Common structured formats: list[dict] with "text"
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, dict):
-                text = item.get("text")
-                if isinstance(text, str) and text.strip():
-                    parts.append(text)
-            elif isinstance(item, str) and item.strip():
-                parts.append(item)
-        return "\n".join(parts).strip()
-    if isinstance(content, dict):
-        text = content.get("text")
-        if isinstance(text, str):
-            return text
-    # Fallback: string representation
-    return str(content)
+    for i in range(len(messages) - 1, -1, -1):
+        if isinstance(messages[i], HumanMessage):
+            return i + 1
+    return 0
 
 
 def _get_stream_mode() -> Union[str, Sequence[str]]:
@@ -103,8 +92,10 @@ async def run_turn(user_input: str, thread_id: str) -> None:
         configurable={"thread_id": thread_id},
     )
 
-    # Track messages we've already displayed in this turn
-    last_seen = 0
+    # Track messages we've already displayed in this turn. On a resumed thread the
+    # first `values` chunk replays the whole checkpointed history, so start printing
+    # after this turn's HumanMessage rather than from index 0.
+    last_seen: int | None = None
     latest_messages: list[BaseMessage] = []
     
     try:
@@ -117,6 +108,9 @@ async def run_turn(user_input: str, thread_id: str) -> None:
             if isinstance(chunk, dict) and "messages" in chunk:
                 chunk_messages = chunk.get("messages") or []
                 latest_messages = chunk_messages
+
+                if last_seen is None:
+                    last_seen = _first_unseen_index(chunk_messages)
 
                 # Only process new messages appended since last chunk
                 for msg in chunk_messages[last_seen:]:
@@ -158,16 +152,44 @@ async def run_turn(user_input: str, thread_id: str) -> None:
                 break
 
 
-async def main():
-    """Main chat loop."""
-    load_dotenv()
-    
-    # Generate a unique thread ID for this session
-    # The checkpointer uses this to store/retrieve conversation history
-    thread_id = str(uuid.uuid4())
-    
+THREAD_ID_ENV = "REACT_AGENT_THREAD_ID"
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """CLI flags. Stdin (`input()`) is still used for the chat loop."""
+    parser = argparse.ArgumentParser(
+        description="Interactive chat for the react agent.",
+    )
+    parser.add_argument(
+        "--thread-id",
+        dest="thread_id",
+        default=None,
+        help=(
+            "Resume a conversation by thread_id. "
+            f"Overrides ${THREAD_ID_ENV}. If omitted, a new id is generated."
+        ),
+    )
+    return parser
+
+
+def resolve_thread_id(cli_thread_id: Optional[str] = None) -> str:
+    """Resolve thread_id: --thread-id > REACT_AGENT_THREAD_ID > new uuid."""
+    if cli_thread_id and cli_thread_id.strip():
+        return cli_thread_id.strip()
+    env = os.environ.get(THREAD_ID_ENV, "").strip()
+    if env:
+        return env
+    return str(uuid.uuid4())
+
+
+async def run_chat(thread_id: str) -> None:
+    """Main chat loop. `input()` stays the turn prompt."""
     print(f"{COLOR_BOLD}React Agent Chat{COLOR_RESET} (type 'exit' to quit)")
-    print(f"{COLOR_DIM}Session: {thread_id[:8]}...{COLOR_RESET}")
+    print(f"{COLOR_DIM}thread_id: {thread_id}{COLOR_RESET}")
+    print(
+        f"{COLOR_DIM}Replay: uv run python -m src.react_agent.chat_cli "
+        f"--thread-id {thread_id}{COLOR_RESET}"
+    )
     print(f"{COLOR_DIM}{'-'*50}{COLOR_RESET}")
     print()
     
@@ -194,5 +216,13 @@ async def main():
         traceback.print_exc()
 
 
+def main(argv: Optional[list[str]] = None) -> None:
+    """Parse flags, then run the stdin chat loop."""
+    load_dotenv()
+    args = build_parser().parse_args(argv)
+    thread_id = resolve_thread_id(args.thread_id)
+    asyncio.run(run_chat(thread_id))
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

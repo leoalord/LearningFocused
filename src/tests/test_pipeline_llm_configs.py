@@ -45,6 +45,13 @@ class TestPipelineLLMConfigs(unittest.TestCase):
 
         self.assertTrue(hasattr(get_article_summary_llm(), "invoke"))
 
+    def test_youtube_llm_builders(self) -> None:
+        os.environ["LF_YOUTUBE_LLM_INITIAL_BACKOFF_SECONDS"] = "0.0"
+        from src.pipeline.youtube.llm_config import get_segmentation_llm, get_summary_llm
+
+        self.assertTrue(hasattr(get_segmentation_llm(), "invoke"))
+        self.assertTrue(hasattr(get_summary_llm(), "invoke"))
+
     def test_neo4j_llm_models_builder(self) -> None:
         from src.pipeline.neo4j_llm_config import get_graph_llm_models
 

@@ -16,6 +16,16 @@ from src.config import (
 
 COLLECTION_NAME = "education_knowledge_engine"
 
+# Retrieval defaults used when tools omit allowed_types.
+DEFAULT_SEGMENT_TYPES = ["transcript_segment", "article_text", "youtube_transcript_segment"]
+DEFAULT_SUMMARY_TYPES = [
+    "series_overview",
+    "series_motivation",
+    "key_takeaway",
+    "article_summary_overview",
+    "youtube_summary_overview",
+]
+
 def get_vector_store() -> Chroma:
     """Initialize and return the ChromaDB vector store."""
     ensure_data_dirs()
@@ -35,7 +45,7 @@ def query_segments(
 ) -> List[Document]:
     """
     Search for detailed content segments in the vector store.
-    Defaults to transcript segments + short-form article text docs.
+    Defaults to podcast transcript segments, Substack article text, and YouTube transcript segments.
     
     Args:
         query: The search query string.
@@ -44,7 +54,7 @@ def query_segments(
     """
     vector_store = get_vector_store()
     
-    types = allowed_types or ["transcript_segment", "article_text"]
+    types = allowed_types or list(DEFAULT_SEGMENT_TYPES)
     # Prefer server-side filtering, but fall back to client-side if the backend doesn't support $in.
     filter_dict: Dict[str, Any] = {"type": {"$in": types}}
     if filter_metadata:
@@ -76,14 +86,9 @@ def query_summaries(
     """
     vector_store = get_vector_store()
 
-    # Summary-like doc types across audio + Substack. Keep this conservative so "summaries"
-    # doesn't accidentally return full article text.
-    types = allowed_types or [
-        "series_overview",
-        "series_motivation",
-        "key_takeaway",
-        "article_summary_overview",
-    ]
+    # Summary-like doc types across audio + Substack + YouTube. Keep this conservative so
+    # "summaries" doesn't accidentally return full article/transcript text.
+    types = allowed_types or list(DEFAULT_SUMMARY_TYPES)
 
     # Prefer server-side $in filtering, but fall back to client-side if unsupported.
     filter_dict: Dict[str, Any] = {"type": {"$in": types}}
@@ -99,6 +104,7 @@ def update_chroma_db(
     *,
     include_audio: bool = True,
     include_articles: bool = True,
+    include_youtube: bool = False,
     confirm_reset: str | None = None,
 ):
     """Backwards-compatible wrapper for pipeline indexing.
@@ -112,6 +118,7 @@ def update_chroma_db(
         reset=reset,
         include_audio=include_audio,
         include_articles=include_articles,
+        include_youtube=include_youtube,
         confirm_reset=confirm_reset,
     )
 

@@ -136,7 +136,12 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Audio pipeline runner")
     p.add_argument("--mode", choices=["daily", "backfill"], default="daily")
     p.add_argument("--transcripts-glob", default="*.json")
-    p.add_argument("--download-limit", type=int, default=5)
+    p.add_argument(
+        "--download-limit",
+        type=int,
+        default=None,
+        help="Max NEW episode downloads this run (scans the full RSS feed). Default: no cap.",
+    )
     p.add_argument("--transcribe-limit", type=int, default=None)
     p.add_argument("--identify-limit", type=int, default=None)
     p.add_argument("--segment-limit", type=int, default=None)
