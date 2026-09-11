@@ -35,6 +35,25 @@ def parse_episode_id(name: str) -> str:
     return match.group(1).strip()
 
 
+def parse_season_episode(name: str) -> tuple[int, int] | None:
+    """Season and episode numbers from a filename, or None if it carries neither.
+
+    `S E76` omits the season digit; those episodes predate the `S2E###` numbering
+    and sort as season 1.
+    """
+    if not name:
+        return None
+    match = _EPISODE_TOKEN.match(name)
+    if not match:
+        return None
+    token = match.group(1)
+    parts = re.match(r"^S(\d*)\s?E(\d+)$", token, re.IGNORECASE)
+    if not parts:
+        return None
+    season = int(parts.group(1)) if parts.group(1) else 1
+    return season, int(parts.group(2))
+
+
 def episode_key(episode_id: str, title: str) -> str:
     """Collision-free key for one episode, for use inside Chroma document ids."""
     digest = hashlib.sha256((title or "").encode("utf-8")).hexdigest()[:8]

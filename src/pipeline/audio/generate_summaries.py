@@ -1,6 +1,5 @@
 import json
 import os
-import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -9,6 +8,8 @@ from dotenv import load_dotenv
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
+
+from src.pipeline.audio.episode_ids import parse_season_episode
 
 # LLM selection (primary + fallbacks) is configured via env vars in this helper module.
 from src.pipeline.audio.llm_config import get_grouping_llm, get_combined_summary_llm
@@ -75,14 +76,18 @@ def load_metadata(file_path: Path) -> Dict[str, Any]:
 # Gemini 504'd when grouping ~332 filenames in one call. Keep batches in this range.
 GROUPING_BATCH_SIZE = 60
 GROUPING_BATCH_OVERLAP = 8
-_EPISODE_RE = re.compile(r"S(\d+)E(\d+)", re.IGNORECASE)
 
 
 def episode_sort_key(filename: str) -> tuple[int, int, int, str]:
-    """Sort numbered episodes (S2E290) before unnumbered titles, then by season/episode."""
-    match = _EPISODE_RE.search(filename)
-    if match:
-        return (0, int(match.group(1)), int(match.group(2)), filename.lower())
+    """Sort numbered episodes (S2E290, S E76) before unnumbered titles, then by season/episode.
+
+    Batching relies on this ordering: sequential episodes must land adjacent so
+    overlapping windows can merge multi-part series that straddle a batch edge.
+    """
+    parsed = parse_season_episode(filename)
+    if parsed:
+        season, episode = parsed
+        return (0, season, episode, filename.lower())
     return (1, 0, 0, filename.lower())
 
 

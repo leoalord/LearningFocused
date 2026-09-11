@@ -106,6 +106,51 @@ def delete_transcript_segments_from_chroma() -> int:
     )
 
 
+def prune_stale_transcript_segments(keep_ids: set[str]) -> int:
+    """Delete `transcript_segment` rows whose id is not in `keep_ids`.
+
+    Upserting cannot remove rows, so a change to the document id scheme (or a
+    deleted episode) would otherwise leave the old rows searchable alongside the
+    new ones. Callers must pass the ids for the *whole* segment corpus; pruning is
+    skipped for an empty set so a partial collection can't wipe the store.
+    """
+    if not keep_ids:
+        return 0
+
+    ensure_data_dirs()
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+    vector_store = Chroma(
+        collection_name=COLLECTION_NAME,
+        embedding_function=embeddings,
+        persist_directory=str(CHROMA_DIR),
+    )
+
+    stale: list[str] = []
+    offset = 0
+    page_size = 2000
+    while True:
+        data = vector_store._collection.get(  # type: ignore[attr-defined]
+            include=["metadatas"],
+            limit=page_size,
+            offset=offset,
+        )
+        ids = data.get("ids") or []
+        metas = data.get("metadatas") or []
+        if not ids:
+            break
+        for _id, meta in zip(ids, metas):
+            if not isinstance(meta, dict):
+                continue
+            if meta.get("type") == "transcript_segment" and str(_id) not in keep_ids:
+                stale.append(str(_id))
+        offset += len(ids)
+
+    if stale:
+        vector_store._collection.delete(ids=stale)  # type: ignore[attr-defined]
+        print(f"Pruned {len(stale)} stale transcript_segment documents from Chroma.")
+    return len(stale)
+
+
 def delete_youtube_from_chroma() -> None:
     """Delete only YouTube-derived documents from Chroma (keeps audio + Substack).
 
@@ -169,11 +214,20 @@ def update_chroma_db(
     article_count = 0
     youtube_count = 0
 
+    # Ids for the full segment corpus, used to prune rows left behind by an older
+    # id scheme once the new ones are safely indexed.
+    segment_ids_on_disk: set[str] = set()
+
     if include_audio:
         print("Collecting audio documents...")
         audio_docs = collect_audio_documents()
         audio_count = len(audio_docs)
         all_documents.extend(audio_docs)
+        segment_ids_on_disk = {
+            str(d.metadata["_chroma_id"])
+            for d in audio_docs
+            if d.metadata.get("type") == "transcript_segment" and d.metadata.get("_chroma_id")
+        }
         print(f"  Found {audio_count} audio documents")
 
     if include_articles:
@@ -304,6 +358,7 @@ def update_chroma_db(
 
     if not to_add_docs:
         print("No new/updated documents to index.")
+        prune_stale_transcript_segments(segment_ids_on_disk)
         return
 
     total_batches = (len(to_add_docs) + batch_size - 1) // batch_size
@@ -312,6 +367,9 @@ def update_chroma_db(
         batch_ids = to_add_ids[i : i + batch_size]
         vector_store.add_documents(documents=batch, ids=batch_ids)  # type: ignore[arg-type]
         print(f"  Indexed batch {i // batch_size + 1}/{total_batches}")
+
+    # Prune only after the replacements are in, so a failed run can't leave a gap.
+    prune_stale_transcript_segments(segment_ids_on_disk)
 
     print("Success! Embeddings generated.")
 

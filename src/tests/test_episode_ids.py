@@ -4,7 +4,9 @@ from src.pipeline.audio.episode_ids import (
     UNKNOWN_EPISODE_ID,
     episode_key,
     parse_episode_id,
+    parse_season_episode,
 )
+from src.pipeline.audio.generate_summaries import episode_sort_key
 from src.pipeline.audio.index_chroma import create_transcript_documents
 
 
@@ -29,6 +31,38 @@ def test_episode_key_separates_reused_episode_numbers():
     left = episode_key("S E2", "S E2 Ep 2 - Do the Laundry! Preparing GT Kids for Real Life")
     right = episode_key("S E2", "S E2 Future of Education A New Way to Do School")
     assert left != right
+
+
+def test_parse_season_episode_defaults_missing_season_to_one():
+    assert parse_season_episode("S2E335 Alpha Anywhere.mp3") == (2, 335)
+    assert parse_season_episode("S E76 Play Therapy.mp3") == (1, 76)
+    assert parse_season_episode("Intro to Academics.mp3") is None
+
+
+def test_sort_orders_S_E_episodes_numerically_not_lexically():
+    """Batching merges multi-part series only when episodes sort adjacent."""
+    names = [
+        "S E100 Hundred.mp3",
+        "S E2 Two.mp3",
+        "S E20 Twenty.mp3",
+        "S E3 Three.mp3",
+    ]
+    ordered = sorted(names, key=episode_sort_key)
+    assert ordered == [
+        "S E2 Two.mp3",
+        "S E3 Three.mp3",
+        "S E20 Twenty.mp3",
+        "S E100 Hundred.mp3",
+    ]
+
+
+def test_sort_places_numbered_episodes_before_untitled_and_seasons_in_order():
+    names = ["Intro to Life Skills.mp3", "S2E290 Later.mp3", "S E76 Earlier.mp3"]
+    assert sorted(names, key=episode_sort_key) == [
+        "S E76 Earlier.mp3",
+        "S2E290 Later.mp3",
+        "Intro to Life Skills.mp3",
+    ]
 
 
 def _segment(topic: str, start: float) -> dict:
