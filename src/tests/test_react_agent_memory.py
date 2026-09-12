@@ -197,3 +197,36 @@ class TestThreadIdFlags(unittest.TestCase):
         generated = resolve_thread_id(None)
         self.assertGreaterEqual(len(generated), 8)
         self.assertNotEqual(generated, resolve_thread_id(None))
+
+
+class TestStreamEnvelope(unittest.TestCase):
+    def test_default_tuple_values_payload_is_unpacked(self) -> None:
+        from langchain.messages import AIMessage, HumanMessage
+
+        from src.react_agent.chat_cli import _first_unseen_index, _values_messages
+
+        history = [
+            HumanMessage(content="old question"),
+            AIMessage(content="old answer"),
+            HumanMessage(content="new question"),
+            AIMessage(content="new answer"),
+        ]
+        self.assertIsNone(_values_messages(("updates", {"model": {"messages": history}})))
+        values = _values_messages(("values", {"messages": history}))
+        self.assertIsNotNone(values)
+        assert values is not None
+        start = _first_unseen_index(values)
+        printed = [m.content for m in values[start:]]
+        self.assertEqual(printed, ["new answer"])
+        self.assertNotIn("old answer", printed)
+
+    def test_bare_values_dict_still_works(self) -> None:
+        from langchain.messages import AIMessage, HumanMessage
+
+        from src.react_agent.chat_cli import _values_messages
+
+        messages = [HumanMessage(content="hi"), AIMessage(content="hello")]
+        self.assertEqual(
+            [m.content for m in (_values_messages({"messages": messages}) or [])],
+            ["hi", "hello"],
+        )

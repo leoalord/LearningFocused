@@ -186,4 +186,4 @@ uv run python scripts/inventory_youtube_rss.py --json-out /tmp/lf_inventory/inve
 
 **Tools:** `yt-dlp 2026.08.19`, `feedparser` via `uv`, Firecrawl scrape of the channel/playlists pages for playlist names and channel ID confirmation.
 
-There is still **no YouTube ingest code** in the repo; this file is the inventory only.
+Ingest lives at `uv run python -m src.pipeline.youtube.run`. This file is the unique-vs-duplicate inventory that skip rules consult.

@@ -134,6 +134,18 @@ def _dedupe_chunks(chunks: Iterable[SourceChunk]) -> list[SourceChunk]:
     return out
 
 
+def current_turn_messages(messages: list[Any]) -> list[Any]:
+    """Messages from this turn's HumanMessage onward (inclusive).
+
+    Checkpointed threads return the full history. Source cards and tool_backed
+    must not include leftover search hits from earlier turns.
+    """
+    for i in range(len(messages) - 1, -1, -1):
+        if isinstance(messages[i], HumanMessage):
+            return list(messages[i:])
+    return list(messages)
+
+
 def sources_from_messages(messages: Iterable[Any]) -> list[SourceChunk]:
     """Collect SourceChunks from structured-search tool messages."""
     chunks: list[SourceChunk] = []
@@ -284,10 +296,11 @@ async def arun_chat(question: str, thread_id: str | None = None) -> dict[str, An
         config=run_config,
     )
     messages = list((result or {}).get("messages") or [])
-    tools_used = tools_used_from_messages(messages)
+    turn_messages = current_turn_messages(messages)
+    tools_used = tools_used_from_messages(turn_messages)
     tool_backed = any(name in SEARCH_TOOL_NAMES for name in tools_used)
 
-    chunks = sources_from_messages(messages)
+    chunks = sources_from_messages(turn_messages)
     if not chunks and tool_backed:
         chunks = _fallback_structured_sources(cleaned)
     elif not chunks:
@@ -297,7 +310,7 @@ async def arun_chat(question: str, thread_id: str | None = None) -> dict[str, An
         except Exception:
             chunks = []
 
-    answer = final_answer_from_messages(messages)
+    answer = final_answer_from_messages(turn_messages)
     if not answer:
         answer = "The agent returned no text. Try asking again."
 

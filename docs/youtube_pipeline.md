@@ -169,7 +169,7 @@ Do **not** change `allowed_types` in TASK-4 (no Chroma writes; nothing to retrie
 
 ```
 src/pipeline/youtube/
-  run.py              # stub in TASK-4; real orchestrator in TASK-5
+  run.py              # orchestrator (TASK-5)
   skip.py             # skip-rule matcher over inventory + RSS
   download.py         # unique video_ids only; refuse channel URLs
   transcribe.py
@@ -178,4 +178,4 @@ src/pipeline/youtube/
   index_chroma.py
 ```
 
-Entrypoint (stub now): `uv run python -m src.pipeline.youtube.run --help`
+Entrypoint: `uv run python -m src.pipeline.youtube.run --help`
