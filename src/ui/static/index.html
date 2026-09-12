@@ -1,0 +1,255 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>LearningFocused — Chat</title>
+    <style>
+      :root {
+        --bg: #f4f1ea;
+        --ink: #1c1917;
+        --muted: #57534e;
+        --card: #fffdf8;
+        --line: #e7e0d4;
+        --accent: #0f766e;
+        --accent-ink: #ecfdf5;
+        --danger: #9f1239;
+        --danger-bg: #fff1f2;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+        background: var(--bg);
+        color: var(--ink);
+      }
+      main {
+        max-width: 46rem;
+        margin: 0 auto;
+        padding: 2rem 1.25rem 4rem;
+      }
+      h1 { font-size: 1.6rem; margin: 0 0 0.25rem; }
+      .lede { color: var(--muted); margin: 0 0 1.5rem; }
+      label { display: block; font-weight: 600; margin-bottom: 0.4rem; }
+      textarea {
+        width: 100%;
+        min-height: 5.5rem;
+        padding: 0.75rem 0.85rem;
+        border: 1px solid var(--line);
+        border-radius: 0.5rem;
+        font: inherit;
+        background: var(--card);
+        resize: vertical;
+      }
+      .row {
+        display: flex;
+        gap: 0.6rem;
+        margin-top: 0.75rem;
+        flex-wrap: wrap;
+      }
+      button {
+        font: inherit;
+        border: 0;
+        border-radius: 0.5rem;
+        padding: 0.55rem 1rem;
+        cursor: pointer;
+        background: var(--accent);
+        color: var(--accent-ink);
+      }
+      button.secondary {
+        background: transparent;
+        color: var(--ink);
+        border: 1px solid var(--line);
+      }
+      button:disabled { opacity: 0.6; cursor: wait; }
+      #status {
+        margin-top: 0.75rem;
+        color: var(--muted);
+        min-height: 1.25rem;
+      }
+      #error {
+        display: none;
+        margin: 1rem 0;
+        padding: 0.85rem 1rem;
+        background: var(--danger-bg);
+        color: var(--danger);
+        border-radius: 0.5rem;
+      }
+      #error.visible { display: block; }
+      #answer-panel { margin-top: 1.75rem; }
+      #answer {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 0.6rem;
+        padding: 1rem 1.1rem;
+        white-space: pre-wrap;
+      }
+      .badge {
+        display: inline-block;
+        font-size: 0.8rem;
+        letter-spacing: 0.02em;
+        background: #ccfbf1;
+        color: #115e59;
+        padding: 0.15rem 0.5rem;
+        border-radius: 999px;
+        margin-bottom: 0.6rem;
+      }
+      h2 { font-size: 1.15rem; margin: 1.5rem 0 0.75rem; }
+      .source-card {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 0.6rem;
+        padding: 0.9rem 1rem;
+        margin-bottom: 0.7rem;
+      }
+      .source-kind {
+        font-size: 0.75rem;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        color: var(--muted);
+      }
+      .source-title { font-weight: 700; margin: 0.2rem 0 0.35rem; }
+      .source-meta { color: var(--muted); font-size: 0.95rem; margin: 0.15rem 0; }
+      .source-snippet { margin: 0.5rem 0 0; color: #44403c; }
+      a { color: var(--accent); }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>LearningFocused</h1>
+      <p class="lede">Ask the local knowledge base. Answers come from the react agent; citations render as source cards.</p>
+
+      <div id="error" role="alert"></div>
+
+      <form id="ask-form">
+        <label for="question">Question</label>
+        <textarea id="question" name="question" required placeholder="What is Two Hour Learning?"></textarea>
+        <div class="row">
+          <button type="submit" id="ask">Ask</button>
+          <button type="button" class="secondary" id="new-thread">New conversation</button>
+        </div>
+      </form>
+      <p id="status" aria-live="polite"></p>
+
+      <section id="answer-panel" hidden>
+        <p id="grounded" class="badge" hidden>Grounded in the knowledge base</p>
+        <h2>Answer</h2>
+        <div id="answer"></div>
+        <h2>Sources</h2>
+        <div id="sources"></div>
+      </section>
+    </main>
+    <script>
+      const THREAD_KEY = "lf_thread_id";
+      const form = document.getElementById("ask-form");
+      const questionEl = document.getElementById("question");
+      const askBtn = document.getElementById("ask");
+      const statusEl = document.getElementById("status");
+      const errorEl = document.getElementById("error");
+      const answerPanel = document.getElementById("answer-panel");
+      const answerEl = document.getElementById("answer");
+      const sourcesEl = document.getElementById("sources");
+      const groundedEl = document.getElementById("grounded");
+
+      function showError(message) {
+        errorEl.textContent = message || "Something went wrong.";
+        errorEl.classList.add("visible");
+      }
+      function clearError() {
+        errorEl.textContent = "";
+        errorEl.classList.remove("visible");
+      }
+      function escapeHtml(value) {
+        return String(value ?? "")
+          .replaceAll("&", "&amp;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;")
+          .replaceAll('"', "&quot;");
+      }
+      function sourceLabel(src) {
+        const title = src.title || src.group_title || "Untitled source";
+        const episode = src.episode_id ? `<p class="source-meta source-episode">Episode: ${escapeHtml(src.episode_id)}</p>` : "";
+        const rawUrl = typeof src.canonical_url === "string" ? src.canonical_url : "";
+        const safeUrl = /^https?:\/\//i.test(rawUrl) ? rawUrl : "";
+        const url = safeUrl
+          ? `<p class="source-meta source-url"><a href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(safeUrl)}</a></p>`
+          : "";
+        const topic = src.topic ? `<p class="source-meta">Topic: ${escapeHtml(src.topic)}</p>` : "";
+        const snippet = src.snippet ? `<p class="source-snippet">${escapeHtml(src.snippet)}</p>` : "";
+        return `
+          <article class="source-card">
+            <div class="source-kind">${escapeHtml(src.kind || "source")}</div>
+            <div class="source-title">${escapeHtml(title)}</div>
+            ${episode}
+            ${url}
+            ${topic}
+            ${snippet}
+          </article>`;
+      }
+      function errorMessage(payload, fallback) {
+        if (!payload) return fallback;
+        if (typeof payload.detail === "string") return payload.detail;
+        if (payload.detail && payload.detail.error) return payload.detail.error;
+        if (payload.error) return payload.error;
+        return fallback;
+      }
+
+      async function loadHealth() {
+        try {
+          const res = await fetch("/api/health");
+          const data = await res.json();
+          if (!data.ok) showError(data.error);
+        } catch (err) {
+          showError("Could not reach the local chat server.");
+        }
+      }
+
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const question = questionEl.value.trim();
+        if (!question) return;
+        clearError();
+        askBtn.disabled = true;
+        statusEl.textContent = "Searching the knowledge base…";
+        try {
+          const res = await fetch("/api/chat", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              question,
+              thread_id: sessionStorage.getItem(THREAD_KEY) || null,
+            }),
+          });
+          const data = await res.json();
+          if (!res.ok) {
+            showError(errorMessage(data, "Chat request failed."));
+            answerPanel.hidden = true;
+            return;
+          }
+          if (data.thread_id) sessionStorage.setItem(THREAD_KEY, data.thread_id);
+          answerEl.textContent = data.answer || "";
+          groundedEl.hidden = !data.tool_backed;
+          const cards = Array.isArray(data.sources) ? data.sources : [];
+          sourcesEl.innerHTML = cards.length
+            ? cards.map(sourceLabel).join("")
+            : "<p class=\"source-meta\">No source cards returned.</p>";
+          answerPanel.hidden = false;
+        } catch (err) {
+          showError("Could not reach the local chat server.");
+        } finally {
+          askBtn.disabled = false;
+          statusEl.textContent = "";
+        }
+      });
+
+      document.getElementById("new-thread").addEventListener("click", () => {
+        sessionStorage.removeItem(THREAD_KEY);
+        answerPanel.hidden = true;
+        clearError();
+        statusEl.textContent = "Started a new conversation.";
+      });
+
+      loadHealth();
+    </script>
+  </body>
+</html>

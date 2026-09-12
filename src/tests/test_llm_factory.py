@@ -60,6 +60,11 @@ class TestCreateChatModel(unittest.TestCase):
         model = create_chat_model(model_name="gemini-3-flash-preview", timeout=1)
         self.assertIsNotNone(model)
 
+    def test_create_chat_model_gemini_flash_latest(self) -> None:
+        model = create_chat_model(model_name="gemini-flash-latest", timeout=1)
+        self.assertIsNotNone(model)
+        self.assertEqual(getattr(model, "model", None), "gemini-flash-latest")
+
     def test_create_chat_model_anthropic(self) -> None:
         model = create_chat_model(model_name="claude-sonnet-4-5", timeout=1)
         self.assertIsNotNone(model)

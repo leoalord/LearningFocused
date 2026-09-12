@@ -15,9 +15,11 @@ import asyncio
 from typing import List, Any, cast
 
 from dotenv import load_dotenv
-from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
+from langchain.messages import HumanMessage, AIMessage
+from langchain_core.messages import BaseMessage
 
 from src.deep_research_agent.graph import deep_researcher
+from src.llm.content import format_message_content
 
 # Simple ANSI colors with auto-disable if not a TTY
 SUPPORTS_COLOR = sys.stdout.isatty()
@@ -33,15 +35,15 @@ def _format_event(key: str, value: Any) -> str:
     if key == "clarify_with_user":
         msgs = value.get("messages") or []
         if msgs:
-            return f"{COLOR_INFO}[Clarify]{COLOR_RESET} {msgs[-1].content}"
+            return f"{COLOR_INFO}[Clarify]{COLOR_RESET} {format_message_content(msgs[-1].content)}"
     if key == "write_research_brief":
-        brief = value.get("research_brief")
+        brief = format_message_content(value.get("research_brief"))
         if brief:
             return f"{COLOR_WARN}[Brief]{COLOR_RESET}\n{brief}"
     if key == "research_supervisor":
         return f"{COLOR_SUPERVISOR}[Supervisor]{COLOR_RESET} ..."
     if key == "final_report_generation":
-        report = value.get("final_report")
+        report = format_message_content(value.get("final_report"))
         if report:
             return f"{COLOR_SUCCESS}[Final Report]{COLOR_RESET}\n{report}"
     return ""

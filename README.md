@@ -115,6 +115,16 @@ uv run python -m src.react_agent.chat_cli
 
 See deeper docs: `src/react_agent/README.md`.
 
+### Local chat UI (answer + source cards)
+
+Browser demo: ask a question, see the answer plus citation cards (`SourceChunk` title + episode or URL). Keys stay in `.env` on the server.
+
+```bash
+uv run python -m src.ui
+```
+
+Open [http://127.0.0.1:8765](http://127.0.0.1:8765). See `src/ui/README.md`.
+
 ## Inspecting and visualizing the stores
 
 ### Chroma (vector DB)
@@ -165,6 +175,7 @@ uv run python -m src.analysis.investigate_entity "MacKenzie Price"
 - **`src/analysis/`**: inspection/visualization tooling
 - **`src/deep_research_agent/`**: LangGraph deep research CLI agent
 - **`src/react_agent/`**: lightweight ReAct-style CLI agent
+- **`src/ui/`**: local FastAPI chat UI (source cards)
 
 ## Notes
 

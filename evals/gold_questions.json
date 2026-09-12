@@ -1,0 +1,110 @@
+[
+  {
+    "id": "2026-alpha-anywhere",
+    "question": "What is Alpha Anywhere, who runs it, and how can families who do not live near an Alpha School campus get the 2-hour academics at home?",
+    "must_include": ["Alpha Anywhere", "Joe Morone", "alphaanywhere.co"],
+    "source_hint": "podcast S2E335 (published 2026-05-27) | segmented_transcripts/S2E335 Alpha Anywhere Elite At-Home Academics, Worldwide_segmented.json"
+  },
+  {
+    "id": "2026-nine-models",
+    "question": "Besides flagship Alpha campuses, what other school models exist in the Alpha ecosystem, and where is Waypoint Academy?",
+    "must_include": ["Waypoint Academy", "Dripping Springs", "NextGen Academy"],
+    "source_hint": "podcast S2E352 (published 2026-08-05) | segmented_transcripts/S2E352 40+ Cities, 9 Models All of Our Schools Explained_segmented.json"
+  },
+  {
+    "id": "2026-esa-gt-anywhere",
+    "question": "How can Texas Educational Savings Accounts (ESAs) be used to access Alpha's homeschool or GT Anywhere academics, and what does the $10,000 platform cost look like with ESA funds?",
+    "must_include": ["GT Anywhere", "$10,000", "Educational Savings"],
+    "source_hint": "podcast S2E320 (published 2026-04-02) | segmented_transcripts/S2E320 School Choice in Action How Educational Savings Accounts Grant Free Access to Alpha_segmented.json"
+  },
+  {
+    "id": "2026-four-cs",
+    "question": "In the AI era, what '4 Cs' does MacKenzie say should sit on top of the old 3 Rs of reading, writing, and arithmetic?",
+    "must_include": ["4 Cs", "critical thinking", "collaboration"],
+    "source_hint": "podcast S2E348 (published 2026-07-17) | segmented_transcripts/S2E348 Goodbye 3 R's, Hello 4 C's The Skills Replacing Reading, Writing, and Arithmetic_segmented.json"
+  },
+  {
+    "id": "2026-brain-lift",
+    "question": "What is Alpha High's Brain Lift research project, and what does student Sloka mean by a 'spiky point of view'?",
+    "must_include": ["Brain Lift", "Sloka", "spiky point of views"],
+    "source_hint": "podcast S2E303 (published 2026-02-03) | segmented_transcripts/S2E303 Unlocking Deep Expertise With Alpha's Brain Lift- Explained by Alpha High Schooler Sloka (Part 1)_segmented.json"
+  },
+  {
+    "id": "2026-guides-not-certified",
+    "question": "Does Alpha require classroom guides to be certified teachers, and why does MacKenzie hire people who do not come from a teaching background?",
+    "must_include": ["certified teachers", "teaching background"],
+    "source_hint": "podcast S2E347 (published 2026-07-15) | segmented_transcripts/S2E347 How We Hire Top Talent to Lead Our Classrooms (Most Aren't Teachers!) – with Dr. Stef Baduria_segmented.json"
+  },
+  {
+    "id": "2026-texas-sports-timeback",
+    "question": "How does Texas Sports Academy use the TimeBack learning platform so student-athletes can finish academics in a couple of hours and spend the rest of the day on sport and life skills?",
+    "must_include": ["Texas Sports Academy", "TimeBack"],
+    "source_hint": "podcast S2E311 (published 2026-03-03) | segmented_transcripts/S2E311 Mastery on the Court and in the Classroom at Texas Sports Academy_segmented.json"
+  },
+  {
+    "id": "2026-pygmalion-effect",
+    "question": "What is the Pygmalion effect, and how do adult expectations and labels shape a child's self-concept according to MacKenzie?",
+    "must_include": ["Pygmalion effect"],
+    "source_hint": "podcast S2E339 (published 2026-06-17) | segmented_transcripts/S2E339 The Pygmalion Effect 8 Rules for Raising Limitless Kids_segmented.json"
+  },
+  {
+    "id": "2026-india-model-test",
+    "question": "What happened when a skeptical educator decided to implement Alpha's learning model in their own school in India?",
+    "must_include": ["my own school in India"],
+    "source_hint": "podcast S2E356 (published 2026-09-04) | segmented_transcripts/S2E356 Liar, Liar, Pants on Fire A Skeptical Educator Tested Our Learning Model in India_segmented.json"
+  },
+  {
+    "id": "substack-map-growth",
+    "question": "What is MAP testing, who makes MAP Growth, and what is a RIT score?",
+    "must_include": ["MAP Growth", "NWEA", "RIT score"],
+    "source_hint": "substack ASK ME ANYTHING #10 | substack_articles/text/ask-me-anything-10-what-is-map-testing-1480fd4af2.md | article_summaries/ask-me-anything-10-what-is-map-testing-1480fd4af2_summary.json | https://futureofeducation.substack.com/p/ask-me-anything-10-what-is-map-testing"
+  },
+  {
+    "id": "substack-guides-100k",
+    "question": "How does Alpha reimagine the teacher role as 'guides', what is a Dean of Parents, and what is the minimum guide salary?",
+    "must_include": ["Dean of Parents", "$100,000"],
+    "source_hint": "substack 6 (Controversial) Ways Alpha Is Reimagining the Role of Teachers | substack_articles/text/6-controversial-ways-alpha-is-reimagining-9291443fe3.md | article_summaries/6-controversial-ways-alpha-is-reimagining-9291443fe3_summary.json"
+  },
+  {
+    "id": "substack-age-vs-knowledge-grade",
+    "question": "What is the difference between age grade and knowledge grade, and why does Alpha reject grouping kids only by chronological age?",
+    "must_include": ["age grade", "knowledge grade"],
+    "source_hint": "substack ASK ME ANYTHING #11 | substack_articles/text/ask-me-anything-11-what-is-age-grade-2a1789fdde.md | article_summaries/ask-me-anything-11-what-is-age-grade-2a1789fdde_summary.json"
+  },
+  {
+    "id": "substack-timeback-alpha-bucks",
+    "question": "What are Alpha's controversial motivation systems, including TimeBack and Alpha Bucks, and how do they relate to Roland Fryer's research?",
+    "must_include": ["TimeBack", "Alpha Bucks", "Roland Fryer"],
+    "source_hint": "substack 4 (Controversial) Motivation Systems that Actually Work | substack_articles/text/4-controversial-motivation-systems-83882110c1.md | article_summaries/4-controversial-motivation-systems-83882110c1_summary.json"
+  },
+  {
+    "id": "substack-pays-kids-bribery",
+    "question": "Is Alpha paying kids to learn just bribery, and how do Alpha bucks supposedly turn extrinsic rewards into intrinsic motivation?",
+    "must_include": ["Alpha bucks", "booster rocket"],
+    "source_hint": "substack ASK ME ANYTHING #21 | substack_articles/text/ask-me-anything-21-alpha-pays-kids-ca7dfc2c35.md | article_summaries/ask-me-anything-21-alpha-pays-kids-ca7dfc2c35_summary.json"
+  },
+  {
+    "id": "s104-mastery-vs-time",
+    "question": "How does Two Hour Learning contrast a personalized mastery-based model with the traditional time-based grade-level model of school?",
+    "must_include": ["Two Hour Learning", "mastery based", "time based"],
+    "source_hint": "podcast S E104 (published 2024-07-04) | segmented_transcripts/S E104 The Revolutionary 2-Hour Learning System_segmented.json"
+  },
+  {
+    "id": "s106-alpha-student-day",
+    "question": "What does a typical day look like for an Alpha School student like Byron, including afternoon life-skills workshops?",
+    "must_include": ["Byron", "life skills", "workshops"],
+    "source_hint": "podcast S E106 | segmented_transcripts/S E106 Daily Life for An Alpha School Student_segmented.json"
+  },
+  {
+    "id": "s2e233-guides-dont-lecture",
+    "question": "According to Alpha guide Jawaan, what do Alpha 'guides' actually do if they are teachers who do not teach academics?",
+    "must_include": ["don't teach academic"],
+    "source_hint": "podcast S2E233 (published 2025-06-05) | segmented_transcripts/S2E233 How 2 Hour Learning Works - with Alpha Guide (and Former Teacher) Jawaan (Part 1)_segmented.json"
+  },
+  {
+    "id": "s2e254-check-charts",
+    "question": "What are check charts, and how does Alpha use them instead of a traditional report card?",
+    "must_include": ["check charts", "report card"],
+    "source_hint": "podcast S2E254 | segmented_transcripts/S2E254 Our Unconventional Report Card Alternative Check Charts Explained_segmented.json"
+  }
+]

@@ -8,6 +8,7 @@ from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 
+from src.pipeline.audio.episode_ids import parse_episode_id
 from src.pipeline.audio.llm_config import get_segmentation_llm
 
 # Load environment variables
@@ -124,9 +125,10 @@ Guidelines:
                 }
             )
 
+        og_file_name = data.get("meta_data", {}).get("og_file_name", "")
         output_data = {
-            "episode_id": data.get("meta_data", {}).get("og_file_name", "").split(" ")[0],
-            "title": data.get("meta_data", {}).get("og_file_name", ""),
+            "episode_id": parse_episode_id(og_file_name),
+            "title": og_file_name,
             "original_meta": data.get("meta_data", {}),
             "segments": processed_segments,
         }

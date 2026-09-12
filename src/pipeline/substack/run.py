@@ -74,6 +74,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             reset=bool(args.reset_chroma),
             include_audio=False,
             include_articles=True,
+            include_youtube=False,
             confirm_reset=args.confirm_reset_chroma,
         )
 

@@ -1,12 +1,17 @@
+import hashlib
 import json
 import os
+import time
+from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from dotenv import load_dotenv
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
+
+from src.pipeline.audio.episode_ids import _EPISODE_TOKEN, parse_season_episode
 
 # LLM selection (primary + fallbacks) is configured via env vars in this helper module.
 from src.pipeline.audio.llm_config import get_grouping_llm, get_combined_summary_llm
@@ -70,35 +75,241 @@ def load_metadata(file_path: Path) -> Dict[str, Any]:
         return json.load(f)
 
 
-def group_episodes(filenames: List[str], metadata_dir: Path) -> List[EpisodeGroup]:
-    print("Grouping episodes based on filenames and metadata...")
+# Gemini 504'd when grouping ~332 filenames in one call. Keep batches in this range.
+GROUPING_BATCH_SIZE = 60
+GROUPING_BATCH_OVERLAP = 8
+GROUPING_TIMEOUT_RETRIES = 3
+# Overlap-region disagreements that would fuse two series into one prompt.
+MAX_MERGED_GROUP = 6
 
-    episodes_context = []
-    for fname in filenames:
-        meta_path = metadata_dir / fname
-        meta = load_metadata(meta_path)
-        episodes_context.append(
-            {
-                "filename": fname,
-                "title": meta.get("title", fname),
-                "summary": (
-                    meta.get("summary", "")[:200] + "..." if meta.get("summary") else "No summary"
-                ),
-                "published": meta.get("published", "Unknown date"),
-                "episode_number": meta.get("itunes_episode", "Unknown"),
-            }
+
+def episode_sort_key(filename: str) -> tuple[int, int, int, str]:
+    """Sort numbered episodes (S2E290, S E76) before unnumbered titles, then by season/episode.
+
+    Batching relies on this ordering: sequential episodes must land adjacent so
+    overlapping windows can merge multi-part series that straddle a batch edge.
+    """
+    parsed = parse_season_episode(filename)
+    if parsed:
+        season, episode = parsed
+        return (0, season, episode, filename.lower())
+    return (1, 0, 0, filename.lower())
+
+
+def iter_grouping_batches(
+    filenames: Sequence[str],
+    batch_size: int = GROUPING_BATCH_SIZE,
+    overlap: int = GROUPING_BATCH_OVERLAP,
+) -> List[List[str]]:
+    """Split a sorted filename list into overlapping windows.
+
+    Overlap at batch boundaries lets Part 1 / Part 2 series that straddle a cut
+    still be grouped together, then merge_and_dedupe_groups assigns each file once.
+    """
+    if batch_size < 1:
+        raise ValueError("batch_size must be >= 1")
+    if overlap < 0:
+        raise ValueError("overlap must be >= 0")
+    if overlap >= batch_size:
+        raise ValueError("overlap must be smaller than batch_size")
+
+    ordered = list(filenames)
+    n = len(ordered)
+    if n == 0:
+        return []
+    if n <= batch_size:
+        return [ordered]
+
+    step = batch_size - overlap
+    batches: List[List[str]] = []
+    start = 0
+    while True:
+        end = min(start + batch_size, n)
+        batches.append(ordered[start:end])
+        if end >= n:
+            break
+        start += step
+    return batches
+
+
+def _is_grouping_timeout(exc: BaseException) -> bool:
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+    if status in (408, 429, 504, 524):
+        return True
+    if isinstance(exc, TimeoutError):
+        return True
+    text = str(exc).lower()
+    tokens = ("timed out", "timeout", "deadline exceeded", "gateway timeout")
+    return any(token in text for token in tokens)
+
+
+def filename_title_key(filename: str) -> str:
+    """Normalized title with the episode token stripped, for re-release matching."""
+    stem = Path(filename).stem
+    match = _EPISODE_TOKEN.match(stem)
+    rest = stem[match.end() :] if match else stem
+    return " ".join(rest.lower().split())
+
+
+def identical_title_groups(filenames: Sequence[str]) -> List[EpisodeGroup]:
+    """Pair episodes that share a title after stripping S/E numbers.
+
+    The feed re-released early episodes under new numbers. Those pairs sit far
+    apart in episode-number order, so overlapping LLM batches never see both.
+    """
+    by_title: dict[str, List[str]] = defaultdict(list)
+    for name in filenames:
+        key = filename_title_key(name)
+        if key:
+            by_title[key].append(name)
+    groups: List[EpisodeGroup] = []
+    for key, members in by_title.items():
+        unique = _unique_preserve_order(members)
+        if len(unique) < 2:
+            continue
+        groups.append(
+            EpisodeGroup(
+                group_id=unique[0],
+                filenames=unique,
+                reasoning="Identical title after stripping episode number; re-released episode.",
+            )
+        )
+    return groups
+
+
+def _unique_preserve_order(items: Sequence[str]) -> List[str]:
+    seen: set[str] = set()
+    unique: List[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        unique.append(item)
+    return unique
+
+
+def merge_and_dedupe_groups(
+    filenames: Sequence[str],
+    groups: Sequence[EpisodeGroup],
+    *,
+    locked: Sequence[EpisodeGroup] = (),
+) -> List[EpisodeGroup]:
+    """Assign each file once. Nested/superset overlap merges; weak overlap does not.
+
+    `locked` groups (identical re-released titles) claim their members first so
+    they survive even when the files never co-occur in an LLM batch.
+    """
+    allowed = set(filenames)
+    assigned: dict[str, int] = {}
+    claimed: List[tuple[EpisodeGroup, List[str]]] = []
+
+    def _take(group: EpisodeGroup, members: List[str]) -> None:
+        if not members:
+            return
+        idx = len(claimed)
+        claimed.append((group, members))
+        for name in members:
+            assigned[name] = idx
+
+    def _valid(group: EpisodeGroup) -> List[str]:
+        return _unique_preserve_order([name for name in group.filenames if name in allowed])
+
+    for group in locked:
+        remaining = [name for name in _valid(group) if name not in assigned]
+        if len(remaining) >= 2:
+            _take(group, remaining)
+
+    ranked = sorted(
+        enumerate(groups),
+        key=lambda item: (-len(_valid(item[1])), item[0]),
+    )
+    for _, group in ranked:
+        valid = _valid(group)
+        remaining = [name for name in valid if name not in assigned]
+        if not remaining:
+            continue
+        if len(valid) > 1 and remaining != valid:
+            overlap = len(valid) - len(remaining)
+            jaccard = overlap / len(valid)
+            # Nested/superset: the leftover of a smaller group is already claimed.
+            # A single shared episode at a batch edge is not enough to fuse two series.
+            if jaccard < 0.5:
+                if len(remaining) == 1:
+                    continue
+            # Cap only collision leftovers, not a complete group the LLM already formed.
+            if len(remaining) > MAX_MERGED_GROUP:
+                remaining = remaining[:MAX_MERGED_GROUP]
+        _take(group, remaining)
+
+    merged: List[EpisodeGroup] = []
+    used_ids: set[str] = set()
+    covered: set[str] = set()
+    for group, members in claimed:
+        group_id = group.group_id
+        original_id = group_id
+        suffix = 2
+        while group_id in used_ids:
+            group_id = f"{original_id}-{suffix}"
+            suffix += 1
+        used_ids.add(group_id)
+        covered.update(members)
+        merged.append(
+            EpisodeGroup(group_id=group_id, filenames=members, reasoning=group.reasoning)
         )
 
-    llm = get_grouping_llm(temperature=0.0)
+    for name in filenames:
+        if name in covered:
+            continue
+        group_id = name
+        original_id = group_id
+        suffix = 2
+        while group_id in used_ids:
+            group_id = f"{original_id}-{suffix}"
+            suffix += 1
+        used_ids.add(group_id)
+        merged.append(
+            EpisodeGroup(
+                group_id=group_id,
+                filenames=[name],
+                reasoning="Ungrouped leftover from batched grouping; assigned as a singleton.",
+            )
+        )
 
+    merged.sort(key=lambda group: episode_sort_key(group.filenames[0] if group.filenames else group.group_id))
+    return merged
+
+
+def _build_episode_context(fname: str, metadata_dir: Path) -> Dict[str, Any]:
+    meta = load_metadata(metadata_dir / fname)
+    return {
+        "filename": fname,
+        "title": meta.get("title", fname),
+        "summary": (
+            meta.get("summary", "")[:200] + "..." if meta.get("summary") else "No summary"
+        ),
+        "published": meta.get("published", "Unknown date"),
+        "episode_number": meta.get("itunes_episode", "Unknown"),
+    }
+
+
+def _group_single_batch(
+    episodes_context: List[Dict[str, Any]],
+    llm: Any,
+    failures: List[str] | None = None,
+) -> List[EpisodeGroup]:
+    """Group one batch of episode metadata via get_grouping_llm. Do not send the full catalog."""
     parser = PydanticOutputParser(pydantic_object=GroupingResponse)
-
     prompt = ChatPromptTemplate.from_messages(
         [
             (
                 "system",
                 """You are an expert content librarian.
 Your task is to group podcast episodes that belong to the same multi-part series or specific topic conversation.
+
+This list is one contiguous batch from a larger catalog. Group only among these episodes.
 
 Guidelines:
 1. Analyze the provided list of episodes, including their filenames, titles, summaries, and publication dates.
@@ -107,6 +318,7 @@ Guidelines:
 4. Episodes that are standalone interviews or topics should be in their own single-episode group.
 5. Every provided filename MUST be assigned to exactly one group.
 6. Create a descriptive group_id for each group.
+7. Do not invent filenames that are not in the list.
 
 {format_instructions}
 """,
@@ -114,23 +326,82 @@ Guidelines:
             ("user", "Episode List:\n{episodes_json}"),
         ]
     )
-
     chain = prompt | llm | parser
+    batch_filenames = [item["filename"] for item in episodes_context]
+    last_error: BaseException | None = None
+    for attempt in range(GROUPING_TIMEOUT_RETRIES):
+        try:
+            result = chain.invoke(
+                {
+                    "episodes_json": json.dumps(episodes_context, indent=2),
+                    "format_instructions": parser.get_format_instructions(),
+                }
+            )
+            return result.groups
+        except Exception as e:
+            last_error = e
+            if _is_grouping_timeout(e) and attempt < GROUPING_TIMEOUT_RETRIES - 1:
+                wait = 2 ** attempt
+                print(
+                    f"Timeout grouping episode batch ({len(batch_filenames)} files); "
+                    f"retry {attempt + 1}/{GROUPING_TIMEOUT_RETRIES - 1} in {wait}s: {e}"
+                )
+                time.sleep(wait)
+                continue
+            print(f"Error grouping episode batch ({len(batch_filenames)} files): {e}")
+            break
+    if last_error is not None and failures is not None:
+        failures.append(str(last_error))
+    return [
+        EpisodeGroup(group_id=f, filenames=[f], reasoning="Fallback error")
+        for f in batch_filenames
+    ]
 
-    try:
-        episodes_json_str = json.dumps(episodes_context, indent=2)
-        result = chain.invoke(
-            {
-                "episodes_json": episodes_json_str,
-                "format_instructions": parser.get_format_instructions(),
-            }
+
+def group_episodes(
+    filenames: List[str],
+    metadata_dir: Path,
+    *,
+    batch_size: int = GROUPING_BATCH_SIZE,
+    overlap: int = GROUPING_BATCH_OVERLAP,
+) -> List[EpisodeGroup]:
+    print("Grouping episodes based on filenames and metadata...")
+    if not filenames:
+        return []
+
+    ordered = sorted(filenames, key=episode_sort_key)
+    batches = iter_grouping_batches(ordered, batch_size=batch_size, overlap=overlap)
+    print(
+        f"Grouping {len(ordered)} episodes in {len(batches)} batches "
+        f"(batch_size={batch_size}, overlap={overlap})."
+    )
+
+    llm = get_grouping_llm(temperature=0.0)
+    batch_groups: List[EpisodeGroup] = []
+    failures: List[str] = []
+    for i, batch in enumerate(batches, start=1):
+        print(f"  Grouping batch {i}/{len(batches)} ({len(batch)} episodes)...")
+        context = [_build_episode_context(fname, metadata_dir) for fname in batch]
+        batch_groups.extend(
+            _group_single_batch(episodes_context=context, llm=llm, failures=failures)
         )
-        return result.groups
-    except Exception as e:
-        print(f"Error grouping episodes: {e}")
-        return [
-            EpisodeGroup(group_id=f, filenames=[f], reasoning="Fallback error") for f in filenames
-        ]
+
+    if failures:
+        print(f"WARNING: {len(failures)}/{len(batches)} grouping batches fell back to singletons.")
+        if len(failures) > max(1, len(batches) // 2):
+            raise RuntimeError(
+                f"{len(failures)}/{len(batches)} grouping batches failed; refusing to write groupings"
+            )
+
+    locked = identical_title_groups(ordered)
+    merged = merge_and_dedupe_groups(ordered, batch_groups, locked=locked)
+    assigned = [name for group in merged for name in group.filenames]
+    if sorted(assigned) != sorted(ordered):
+        raise RuntimeError(
+            "Batched grouping failed uniqueness check: every filename must appear in exactly one group."
+        )
+    print(f"Merged to {len(merged)} groups after overlap dedupe.")
+    return merged
 
 
 def generate_combined_summary(
@@ -281,7 +552,8 @@ def process_combined_summaries(transcripts_dir: Path, metadata_dir: Path, output
             safe_name = "".join(
                 [c if c.isalnum() or c in (" ", "-", "_") else "" for c in group.group_id]
             ).strip()
-            safe_name = safe_name.replace(" ", "_")[:50]
+            digest = hashlib.sha256(group.group_id.encode("utf-8")).hexdigest()[:7]
+            safe_name = f"{safe_name.replace(' ', '_')[:42]}_{digest}"
             output_path = output_dir / f"summary_{safe_name}.json"
 
             with open(output_path, "w", encoding="utf-8") as f:

@@ -7,8 +7,8 @@ Purpose:
 Key Components:
     - create_agent: LangChain helper for an agent runtime (built on LangGraph)
     - Tools: Imported from shared tools module (Chroma, Neo4j)
-    - Model: Configurable LLM (default: gpt-5-mini for speed/cost)
-    - Checkpointer: MemorySaver for conversation persistence within a session
+    - Model: Configurable LLM (default: gemini-flash-latest)
+    - Checkpointer: SqliteSaver on a gitignored path (survives process restart)
     
 Usage:
     from src.react_agent.graph import react_agent
@@ -20,17 +20,25 @@ Usage:
 
 from typing import Any, Optional
 from langchain.agents import create_agent
-from langchain_core.messages import HumanMessage
+from langchain.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
-from langgraph.checkpoint.memory import MemorySaver
 
 from src.react_agent.configuration import Configuration
 from src.react_agent.tools import tools
 from src.react_agent.utils import create_chat_model
 from src.react_agent.prompts import system_prompt
+from src.react_agent.checkpointer import get_sqlite_checkpointer
 
-# Module-level checkpointer for conversation memory (persists during process lifetime)
-memory = MemorySaver()
+_memory = None
+_react_agent = None
+
+
+def _default_memory():
+    """Open SQLite on first use so importing the package does not create files."""
+    global _memory
+    if _memory is None:
+        _memory = get_sqlite_checkpointer()
+    return _memory
 
 
 def get_react_agent(
@@ -42,7 +50,8 @@ def get_react_agent(
     Args:
         config: Optional RunnableConfig with configurable dict (model, max_tokens, etc.)
         checkpointer: Optional checkpointer for conversation memory. Defaults to
-            module-level MemorySaver. Pass a thread_id in config to enable memory:
+            the production SqliteSaver. Tests may inject MemorySaver. Pass a
+            thread_id in config to enable memory:
             config={"configurable": {"thread_id": "my-thread"}}
         
     Returns:
@@ -65,7 +74,7 @@ def get_react_agent(
         model,
         tools=tools,
         system_prompt=system_prompt,
-        checkpointer=checkpointer or memory,
+        checkpointer=checkpointer if checkpointer is not None else _default_memory(),
     )
 
     # Respect configured iteration limits; default to Configuration.max_iterations
@@ -78,5 +87,12 @@ def get_react_agent(
     return agent.with_config(recursion_limit=recursion_limit)
 
 
-# Create default agent instance with memory checkpointer
-react_agent = get_react_agent(checkpointer=memory)
+def __getattr__(name: str) -> Any:
+    global _react_agent
+    if name == "memory":
+        return _default_memory()
+    if name == "react_agent":
+        if _react_agent is None:
+            _react_agent = get_react_agent()
+        return _react_agent
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

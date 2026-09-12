@@ -4,6 +4,7 @@ This package contains the processing pipelines for different source types.
 
 - **Audio/Podcast pipeline**: `src/pipeline/audio/`
 - **Substack pipeline**: `src/pipeline/substack/`
+- **YouTube pipeline**: `src/pipeline/youtube/` (unique ingest; design in `docs/youtube_pipeline.md`)
 
 ### Recommended entrypoints
 
@@ -23,6 +24,14 @@ uv run python -m src.pipeline.audio.process_all
 
 ```bash
 uv run python -m src.pipeline.substack.run -- --mode daily --ingest-limit 10
+```
+
+- **YouTube unique ingest** (V1 cap; refuses `--channel` / `--reset-chroma` / UU dump):
+
+```bash
+uv run python -m src.pipeline.youtube.run --help
+uv run python -m src.pipeline.youtube.run --dry-run
+uv run python -m src.pipeline.youtube.run
 ```
 
 ### Notes

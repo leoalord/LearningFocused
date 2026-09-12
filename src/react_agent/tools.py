@@ -5,7 +5,7 @@ Purpose:
     This keeps tools DRY while allowing react_agent-specific overrides if needed.
     
 Available Tools (from shared module):
-    - search_knowledge_base: Semantic search over podcast transcripts/summaries (Chroma)
+    - search_knowledge_base: Semantic search over podcast, Substack, and YouTube docs (Chroma)
     - query_knowledge_graph: Run Cypher queries against Neo4j
     - inspect_graph_schema: Get Neo4j schema for writing Cypher
     

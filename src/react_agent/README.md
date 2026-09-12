@@ -7,7 +7,7 @@ A lightweight LangChain ReAct agent for querying the Future of Education podcast
 This agent implements the **ReAct pattern** (Reason → Act/tool call → Observe → repeat) using `langchain.agents.create_agent`. It's intended for fast, tool-grounded Q&A over the local stores (Chroma + Neo4j).
 
 **Features:**
-- **Conversation memory** via LangGraph's `MemorySaver` checkpointer (persists within session)
+- **Conversation memory** via LangGraph's SQLite checkpointer (survives process restart)
 - **Multi-provider support** (OpenAI, Anthropic, Google, Fireworks)
 - **Streaming** tool calls and responses
 
@@ -20,6 +20,7 @@ This agent implements the **ReAct pattern** (Reason → Act/tool call → Observ
 | File | Purpose |
 |------|---------|
 | `graph.py` | Main agent using `langchain.agents.create_agent` |
+| `checkpointer.py` | SqliteSaver helper (gitignored `.checkpoints/react_agent.sqlite`) |
 | `prompts.py` | System prompt guiding agent behavior |
 | `configuration.py` | Settings (model, max iterations, etc.) with model registry |
 | `utils.py` | Helper functions for model creation and tool management |
@@ -77,9 +78,27 @@ Configuration can be overridden at runtime via `RunnableConfig`.
 ### Interactive Chat
 
 ```bash
-# Interactive chat
+# Interactive chat (prints the full thread_id)
 uv run python -m src.react_agent.chat_cli
 ```
+
+### Replay a thread after restart
+
+Checkpoints are stored at `.checkpoints/react_agent.sqlite` (gitignored; override with `REACT_AGENT_CHECKPOINT_PATH`). The CLI prints the full `thread_id`. Pass it back on the next process to continue the same conversation:
+
+```bash
+# Process 1 — start a chat and copy the printed thread_id
+uv run python -m src.react_agent.chat_cli
+# thread_id: 550e8400-e29b-41d4-a716-446655440000
+# You: Remember that my favorite episode is about Two Hour Learning.
+# ... type exit ...
+
+# Process 2 — same thread_id continues the conversation
+uv run python -m src.react_agent.chat_cli --thread-id 550e8400-e29b-41d4-a716-446655440000
+# You: What did I say my favorite episode was?
+```
+
+You can also set `REACT_AGENT_THREAD_ID` instead of `--thread-id`.
 
 ### Programmatic Usage
 
@@ -87,8 +106,8 @@ uv run python -m src.react_agent.chat_cli
 from src.react_agent.graph import react_agent, get_react_agent
 from langchain_core.messages import HumanMessage
 
-# Use default agent with conversation memory
-# Pass a thread_id to enable memory persistence within the session
+# Use default agent with durable SQLite conversation memory
+# Pass a thread_id so the same conversation survives process restart
 result = await react_agent.ainvoke(
     {"messages": [HumanMessage(content="What is Two Hour Learning?")]},
     config={"configurable": {"thread_id": "my-session-123"}}
@@ -127,7 +146,7 @@ result = await custom_agent.ainvoke({
 | Tool access | Direct | Delegated via researchers |
 | Output | Single response | Structured report |
 | State | Minimal (messages + checkpointer memory) | Rich (brief, notes, iterations) |
-| Memory | MemorySaver checkpointer (session-scoped) | Graph state |
+| Memory | SqliteSaver checkpointer (disk, by thread_id) | Graph state |
 | Model creation | Provider-specific classes | `init_chat_model` with configurable fields |
 
 ## Tools Available

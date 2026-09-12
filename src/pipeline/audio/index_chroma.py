@@ -16,6 +16,7 @@ from typing import Any, Dict, List
 from langchain_core.documents import Document
 
 from src.config import COMBINED_DIR, SEGMENTED_DIR
+from src.pipeline.audio.episode_ids import UNKNOWN_EPISODE_ID, episode_key, parse_episode_id
 
 
 def _load_json_file(file_path: str) -> Dict[str, Any]:
@@ -101,9 +102,15 @@ def create_transcript_documents(transcript_data: Dict[str, Any]) -> List[Documen
     """Convert a segmented transcript object into Documents (one per topic segment)."""
     documents: List[Document] = []
 
-    episode_id = transcript_data.get("episode_id", "Unknown ID")
     title = transcript_data.get("title", "Unknown Title")
     segments = transcript_data.get("segments", []) or []
+
+    # Derive from the title rather than trusting the stored field: artifacts segmented
+    # before the parser fix carry filename fragments like "S" or "Intro" there.
+    episode_id = parse_episode_id(title)
+    if episode_id == UNKNOWN_EPISODE_ID:
+        episode_id = parse_episode_id(str(transcript_data.get("episode_id") or ""))
+    key = episode_key(episode_id, title)
 
     for segment in segments:
         topic = segment.get("topic", "General")
@@ -117,9 +124,10 @@ def create_transcript_documents(transcript_data: Dict[str, Any]) -> List[Documen
             continue
 
         combined_text = f"Episode: {title}\nTopic: {topic}\nSummary: {summary}\n\nTranscript:\n{content}"
-        # Use episode_id + start_time + topic as unique identifier for ChromaDB deduplication
+        # `key` disambiguates episodes that share an episode number (the feed reuses
+        # `S E2` and `S2E215`), so segments from different recordings can't collide.
         # Fallback to topic index if start_time not available
-        segment_id = f"transcript_segment_{episode_id}_{start_time or 'unknown'}_{topic}"
+        segment_id = f"transcript_segment_{key}_{start_time if start_time is not None else 'unknown'}_{topic}"
         documents.append(
             Document(
                 page_content=combined_text,
@@ -141,8 +149,13 @@ def create_transcript_documents(transcript_data: Dict[str, Any]) -> List[Documen
     return documents
 
 
-def collect_audio_documents() -> List[Document]:
-    """Collect all audio-derived Documents for Chroma indexing."""
+def collect_audio_documents(unreadable: List[str] | None = None) -> List[Document]:
+    """Collect all audio-derived Documents for Chroma indexing.
+
+    Unreadable artifacts are skipped, and their paths are appended to `unreadable`
+    when provided. Callers that prune Chroma by the ids collected here must treat a
+    non-empty list as "corpus incomplete" and not delete the rows they couldn't see.
+    """
     documents: List[Document] = []
 
     # Combined summaries
@@ -153,7 +166,9 @@ def collect_audio_documents() -> List[Document]:
                 try:
                     data = _load_json_file(path)
                     documents.extend(create_summary_documents(data))
-                except Exception:
+                except Exception as exc:
+                    if unreadable is not None:
+                        unreadable.append(f"{path}: {exc}")
                     continue
 
     # Segmented transcripts
@@ -164,7 +179,9 @@ def collect_audio_documents() -> List[Document]:
                 try:
                     data = _load_json_file(path)
                     documents.extend(create_transcript_documents(data))
-                except Exception:
+                except Exception as exc:
+                    if unreadable is not None:
+                        unreadable.append(f"{path}: {exc}")
                     continue
 
     return documents
