@@ -45,6 +45,7 @@ from src.pipeline.youtube.constants import (
 )
 from src.pipeline.youtube.download import (
     RefusedDownloadError,
+    assert_safe_video_id,
     compact_info,
     download_audio_extract,
     download_captions,
@@ -100,6 +101,7 @@ class Candidate:
     channel_id: str = ""
     channel_handle: str = ""
     url: str = ""
+    upload_date: str = ""
 
     @property
     def source_type(self) -> str:
@@ -291,6 +293,7 @@ def _enrich_candidate(cand: Candidate) -> Candidate:
     else:
         cand.channel_handle = handle or cand.channel_handle
     cand.url = str(info.get("url") or watch_url(cand.video_id))
+    cand.upload_date = cand.upload_date or str(info.get("upload_date") or "")
     return cand
 
 
@@ -306,6 +309,8 @@ def persist_sidecar(cand: Candidate, *, skip: SkipDecision | None = None, status
         "channel_id": cand.channel_id,
         "channel_handle": cand.channel_handle or (FOE_HANDLE if cand.channel_id == FOE_CHANNEL_ID else cand.channel_handle),
         "playlist_id": cand.playlist_id,
+        # `index_chroma._base_meta` reads this for the document's published date.
+        "upload_date": cand.upload_date or None,
         "status": status,
         "skip_reason": skip.skip_reason if skip else None,
         "skip_matched_rss_title": skip.matched_rss_title if skip else None,
@@ -329,7 +334,7 @@ def ingest_one(cand: Candidate, *, force: bool = False) -> str:
             transcribe_from_captions(cand.video_id, caption)
         else:
             audio = find_audio_file(cand.video_id) or download_audio_extract(cand.video_id)
-            transcribe_from_audio(cand.video_id, audio)
+            transcribe_from_audio(cand.video_id, audio, force=force)
 
     segment_video(
         cand.video_id,
@@ -360,7 +365,7 @@ def write_skip_log(skipped: list[SkipDecision], extra: dict[str, Any] | None = N
     return path
 
 
-def index_youtube_only() -> None:
+def index_youtube_only(*, prune_stale: bool = False) -> None:
     from src.pipeline.index_chroma import update_chroma_db
 
     update_chroma_db(
@@ -369,7 +374,11 @@ def index_youtube_only() -> None:
         include_articles=False,
         include_youtube=True,
         confirm_reset=None,
+        prune_stale=prune_stale,
     )
+
+
+V1_TOTAL_CAP = V1_UNIQUE_LONGFORM + V1_APPEARANCES + V1_BRANDING + V1_SHORTS
 
 
 def _refused_from_args(args: argparse.Namespace) -> list[str]:
@@ -387,6 +396,26 @@ def _refused_from_args(args: argparse.Namespace) -> list[str]:
             reasons.append("@thealphaschool is refused")
         if "/shorts" in lowered and "list=pl" not in lowered:
             reasons.append("Shorts-tab bulk dump is refused; use curated playlist only")
+        if not reasons:
+            # Selection always uses the curated V1 playlists, so a benign --playlist
+            # would be silently ignored and the operator would think it took effect.
+            reasons.append("--playlist is not wired to selection; use --video-id instead")
+
+    # The per-bucket limits exist to tune the V1 mix, not to raise the total.
+    for flag, value, cap in (
+        ("--longform-limit", args.longform_limit, V1_UNIQUE_LONGFORM),
+        ("--appearances-limit", args.appearances_limit, V1_APPEARANCES),
+        ("--branding-limit", args.branding_limit, V1_BRANDING),
+        ("--shorts-limit", args.shorts_limit, V1_SHORTS),
+    ):
+        if value > cap:
+            reasons.append(f"{flag}={value} exceeds the V1 cap of {cap}")
+        elif value < 0:
+            reasons.append(f"{flag}={value} must not be negative")
+    if len(args.video_id) > V1_TOTAL_CAP:
+        reasons.append(
+            f"--video-id given {len(args.video_id)} times, over the V1 total cap of {V1_TOTAL_CAP}"
+        )
     return reasons
 
 
@@ -403,7 +432,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--print-plan", action="store_true", help="Print the ingest contract and exit.")
     p.add_argument("--dry-run", action="store_true", help="Resolve V1 candidates + skip proof; do not download.")
     p.add_argument("--skip-chroma", action="store_true", help="Skip Chroma upsert.")
+    p.add_argument(
+        "--prune-stale-chroma",
+        action="store_true",
+        help=(
+            "After upsert, delete youtube_transcript_segment rows the on-disk artifacts "
+            "no longer produce (needed after a document-id change). Only safe when this "
+            "machine holds the complete youtube_videos/segmented set."
+        ),
+    )
     p.add_argument("--force", action="store_true", help="Redo transcript/segment/summary even if files exist.")
+    p.add_argument(
+        "--allow-empty-rss",
+        action="store_true",
+        help="Ingest even if the podcast RSS feed is empty (disables duplicate-skip rules).",
+    )
     p.add_argument("--longform-limit", type=int, default=V1_UNIQUE_LONGFORM)
     p.add_argument("--appearances-limit", type=int, default=V1_APPEARANCES)
     p.add_argument("--branding-limit", type=int, default=V1_BRANDING)
@@ -442,6 +485,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     print("Loading RSS for skip matching...")
     rss_entries = load_rss_entries()
     print(f"  RSS episodes: {len(rss_entries)}")
+    if not rss_entries and not args.allow_empty_rss:
+        # feedparser never raises: a DNS failure or 5xx yields zero entries, which
+        # makes every title/same-recording skip rule a no-op and silently ingests
+        # the podcast twins this pipeline exists to exclude.
+        print(
+            "Refusing to run ingest: the podcast RSS feed returned no episodes, so "
+            "duplicate-skip rules would all pass. Retry, or pass --allow-empty-rss "
+            "to ingest without duplicate protection.",
+            file=sys.stderr,
+        )
+        return 2
     print("Loading Gifted Minds Episodes playlist (skip-by-id)...")
     episodes_ids = _episodes_playlist_ids()
     print(f"  Episodes playlist ids: {len(episodes_ids)}")
@@ -458,7 +512,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.video_id:
         candidates: list[Candidate] = []
         skipped: list[SkipDecision] = []
-        for vid in args.video_id:
+        for requested in args.video_id:
+            # Normalize before the id reaches filenames and Chroma document ids.
+            vid = assert_safe_video_id(requested)
             raw = fetch_video_metadata(vid)
             info = compact_info(raw)
             decision = skip_decision(
@@ -540,7 +596,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"\nIngested {len(result.ingested)} / {len(candidates)} (failed {len(result.failed)})")
     if not args.skip_chroma:
         print("\n=== CHROMA UPSERT (youtube_* only; no reset, no audio/Substack) ===")
-        index_youtube_only()
+        index_youtube_only(prune_stale=args.prune_stale_chroma)
     else:
         print("Skipping Chroma upsert (--skip-chroma).")
 

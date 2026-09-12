@@ -106,13 +106,17 @@ def delete_transcript_segments_from_chroma() -> int:
     )
 
 
-def prune_stale_transcript_segments(keep_ids: set[str]) -> int:
-    """Delete `transcript_segment` rows whose id is not in `keep_ids`.
+def prune_stale_segments(keep_ids: set[str], doc_type: str = "transcript_segment") -> int:
+    """Delete `doc_type` rows whose id is not in `keep_ids`.
 
     Upserting cannot remove rows, so a change to the document id scheme (or a
     deleted episode) would otherwise leave the old rows searchable alongside the
-    new ones. Callers must pass the ids for the *whole* segment corpus; pruning is
-    skipped for an empty set so a partial collection can't wipe the store.
+    new ones.
+
+    This DELETES data, so callers must pass the ids for the *whole* corpus of
+    `doc_type`. `update_chroma_db` only calls this when explicitly asked and when
+    every artifact on disk parsed, because the collectors skip unreadable files and
+    a partial id set would otherwise delete every episode it could not read.
     """
     if not keep_ids:
         return 0
@@ -141,14 +145,37 @@ def prune_stale_transcript_segments(keep_ids: set[str]) -> int:
         for _id, meta in zip(ids, metas):
             if not isinstance(meta, dict):
                 continue
-            if meta.get("type") == "transcript_segment" and str(_id) not in keep_ids:
+            if meta.get("type") == doc_type and str(_id) not in keep_ids:
                 stale.append(str(_id))
         offset += len(ids)
 
     if stale:
         vector_store._collection.delete(ids=stale)  # type: ignore[attr-defined]
-        print(f"Pruned {len(stale)} stale transcript_segment documents from Chroma.")
+        print(f"Pruned {len(stale)} stale {doc_type} documents from Chroma.")
     return len(stale)
+
+
+def _prune_after_index(
+    *,
+    prune_stale: bool,
+    unreadable: list[str],
+    segment_ids: set[str],
+    youtube_segment_ids: set[str],
+) -> None:
+    """Run the opt-in prune, refusing when the id sets can't be trusted."""
+    if not prune_stale:
+        return
+    if unreadable:
+        print(
+            f"Skipping prune: {len(unreadable)} artifact(s) could not be read, so the "
+            "collected ids are an incomplete picture of the corpus and pruning would "
+            "delete live rows. Fix or remove those files and re-run."
+        )
+        return
+    if segment_ids:
+        prune_stale_segments(segment_ids, "transcript_segment")
+    if youtube_segment_ids:
+        prune_stale_segments(youtube_segment_ids, "youtube_transcript_segment")
 
 
 def delete_youtube_from_chroma() -> None:
@@ -167,6 +194,7 @@ def update_chroma_db(
     include_articles: bool = True,
     include_youtube: bool = False,
     confirm_reset: str | None = None,
+    prune_stale: bool = False,
 ) -> None:
     """Update the ChromaDB vector store.
 
@@ -175,6 +203,10 @@ def update_chroma_db(
         include_audio: If True, collect/index audio-derived documents.
         include_articles: If True, collect/index Substack-derived documents.
         include_youtube: If True, collect/index YouTube-derived documents (not folded into audio).
+        prune_stale: If True, delete segment rows that the artifacts on disk no
+            longer produce. Needed after a document-id scheme change, and off by
+            default because indexing a partial set of artifacts would otherwise
+            delete the segments for every episode not present locally.
     """
     ensure_data_dirs()
 
@@ -217,10 +249,14 @@ def update_chroma_db(
     # Ids for the full segment corpus, used to prune rows left behind by an older
     # id scheme once the new ones are safely indexed.
     segment_ids_on_disk: set[str] = set()
+    youtube_segment_ids_on_disk: set[str] = set()
+    # Artifacts the collectors could not parse. Their ids are missing from the sets
+    # above, so pruning against an incomplete set would delete live rows.
+    unreadable: list[str] = []
 
     if include_audio:
         print("Collecting audio documents...")
-        audio_docs = collect_audio_documents()
+        audio_docs = collect_audio_documents(unreadable)
         audio_count = len(audio_docs)
         all_documents.extend(audio_docs)
         segment_ids_on_disk = {
@@ -246,15 +282,28 @@ def update_chroma_db(
 
     if include_youtube:
         print("Collecting YouTube documents...")
-        youtube_docs = collect_youtube_documents()
+        youtube_docs = collect_youtube_documents(unreadable)
         youtube_count = len(youtube_docs)
         all_documents.extend(youtube_docs)
+        youtube_segment_ids_on_disk = {
+            str(d.metadata["_chroma_id"])
+            for d in youtube_docs
+            if d.metadata.get("type") == "youtube_transcript_segment"
+            and d.metadata.get("_chroma_id")
+        }
         yt_ids = {
             d.metadata.get("video_id")
             for d in youtube_docs
             if isinstance(d.metadata, dict) and d.metadata.get("video_id")
         }
         print(f"  Found {youtube_count} YouTube documents (~{len(yt_ids)} videos)")
+
+    if unreadable:
+        print(f"  WARNING: {len(unreadable)} artifact(s) could not be read and were skipped:")
+        for item in unreadable[:10]:
+            print(f"    - {item}")
+        if len(unreadable) > 10:
+            print(f"    ... and {len(unreadable) - 10} more")
 
     if not all_documents:
         print("No documents found to index.")
@@ -358,7 +407,12 @@ def update_chroma_db(
 
     if not to_add_docs:
         print("No new/updated documents to index.")
-        prune_stale_transcript_segments(segment_ids_on_disk)
+        _prune_after_index(
+            prune_stale=prune_stale,
+            unreadable=unreadable,
+            segment_ids=segment_ids_on_disk,
+            youtube_segment_ids=youtube_segment_ids_on_disk,
+        )
         return
 
     total_batches = (len(to_add_docs) + batch_size - 1) // batch_size
@@ -369,7 +423,12 @@ def update_chroma_db(
         print(f"  Indexed batch {i // batch_size + 1}/{total_batches}")
 
     # Prune only after the replacements are in, so a failed run can't leave a gap.
-    prune_stale_transcript_segments(segment_ids_on_disk)
+    _prune_after_index(
+        prune_stale=prune_stale,
+        unreadable=unreadable,
+        segment_ids=segment_ids_on_disk,
+        youtube_segment_ids=youtube_segment_ids_on_disk,
+    )
 
     print("Success! Embeddings generated.")
 

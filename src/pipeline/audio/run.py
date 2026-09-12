@@ -109,6 +109,15 @@ def build_parser() -> argparse.ArgumentParser:
     # Destructive option (hidden; requires env+confirm token inside update_chroma_db anyway)
     p.add_argument("--reset-chroma", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--confirm-reset-chroma", default=None, help=argparse.SUPPRESS)
+    p.add_argument(
+        "--prune-stale-chroma",
+        action="store_true",
+        help=(
+            "Delete transcript_segment rows the on-disk artifacts no longer produce "
+            "(needed after a document-id change). Only safe when this machine holds "
+            "the complete segmented_transcripts set."
+        ),
+    )
 
     p.add_argument(
         "process_all_args",
@@ -182,6 +191,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 include_articles=False,
                 include_youtube=False,
                 confirm_reset=args.confirm_reset_chroma,
+                prune_stale=args.prune_stale_chroma,
             )
 
     if not args.skip_neo4j:

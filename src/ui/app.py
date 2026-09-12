@@ -5,6 +5,7 @@ Start: `uv run python -m src.ui`
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -15,6 +16,8 @@ from pydantic import BaseModel, Field
 from src.ui.service import ChatUIError, arun_chat, health_payload
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -63,10 +66,11 @@ async def chat(body: ChatRequest) -> ChatResponse:
             detail={"error": exc.message, "code": exc.code},
         ) from exc
     except Exception as exc:  # noqa: BLE001
+        logger.exception("Chat request failed")
         raise HTTPException(
             status_code=500,
             detail={
-                "error": f"Chat failed: {exc}",
+                "error": "Chat failed. Check the server logs for details.",
                 "code": "chat_failed",
             },
         ) from exc

@@ -111,6 +111,10 @@ def same_recording_match(
         # so duration collisions are never skipped on duration alone.
         if not (tokens(rss_title) & tokens(yt_title)):
             continue
+        # One shared generic token ("school") plus a ±5s duration hit is not a cue.
+        shared = tokens(rss_title) & tokens(yt_title)
+        if len(shared) < 2:
+            continue
         if best is None or title_s > float(best["title_score"]):
             best = {
                 "rss_title": rss_title,

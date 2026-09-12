@@ -34,6 +34,30 @@ class TestYoutubeRunRefuses(unittest.TestCase):
         code = main(["--playlist", "https://www.youtube.com/@thealphaschool"])
         self.assertEqual(code, 2)
 
+    def test_refuses_benign_playlist_that_is_not_wired(self) -> None:
+        code = main(["--playlist", "https://www.youtube.com/playlist?list=PLabcdefghij"])
+        self.assertEqual(code, 2)
+
+    def test_refuses_limits_above_v1_cap(self) -> None:
+        code = main(["--longform-limit", "500"])
+        self.assertEqual(code, 2)
+
+    def test_refuses_empty_rss_without_override(self) -> None:
+        from unittest.mock import patch
+
+        with patch("src.pipeline.youtube.run.load_rss_entries", return_value=[]), patch(
+            "src.pipeline.youtube.run._episodes_playlist_ids", return_value=set()
+        ):
+            code = main(["--dry-run"])
+        self.assertEqual(code, 2)
+
+    def test_prune_stale_chroma_flag_exists_and_defaults_off(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args([])
+        self.assertFalse(args.prune_stale_chroma)
+        args = parser.parse_args(["--prune-stale-chroma"])
+        self.assertTrue(args.prune_stale_chroma)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -82,6 +82,32 @@ class TestSourceHintAndMissSplit(unittest.TestCase):
             classify_miss(disk_present=True, indexed=True, phrases_in_corpus=True),
             MISS_RETRIEVER_FAILED,
         )
+        self.assertEqual(
+            classify_miss(disk_present=True, indexed=False, phrases_in_corpus=True),
+            MISS_RETRIEVER_FAILED,
+        )
+
+    def test_loader_rejects_empty_must_include(self) -> None:
+        from tempfile import NamedTemporaryFile
+        import json as json_lib
+
+        payload = [{"id": "x", "question": "q", "must_include": [], "source_hint": "h"}]
+        with NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+            json_lib.dump(payload, handle)
+            path = Path(handle.name)
+        try:
+            with self.assertRaises(ValueError):
+                load_gold_questions(path)
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_parse_s1_and_se_tokens(self) -> None:
+        hint = parse_source_hint(
+            "podcast S1E9 | segmented_transcripts/S1E9 First_segmented.json"
+        )
+        self.assertEqual(hint.episode_token, "S1E9")
+        hint2 = parse_source_hint("podcast SE7 trailer")
+        self.assertEqual(hint2.episode_token, "SE7")
 
 
 class TestGoldSetLoads(unittest.TestCase):

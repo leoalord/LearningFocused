@@ -26,14 +26,16 @@ DEFAULT_SUMMARY_TYPES = [
     "youtube_summary_overview",
 ]
 
-def get_vector_store() -> Chroma:
+def get_vector_store(*, create_if_missing: bool = True) -> Chroma:
     """Initialize and return the ChromaDB vector store."""
-    ensure_data_dirs()
+    if create_if_missing:
+        ensure_data_dirs()
     embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
     return Chroma(
         collection_name=COLLECTION_NAME,
         embedding_function=embeddings,
-        persist_directory=str(CHROMA_DIR)
+        persist_directory=str(CHROMA_DIR),
+        create_collection_if_not_exists=create_if_missing,
     )
 
 def query_segments(
@@ -42,6 +44,7 @@ def query_segments(
     filter_metadata: Optional[Dict[str, Any]] = None,
     *,
     allowed_types: Optional[List[str]] = None,
+    vector_store: Optional[Chroma] = None,
 ) -> List[Document]:
     """
     Search for detailed content segments in the vector store.
@@ -52,7 +55,7 @@ def query_segments(
         k: Number of results to return.
         filter_metadata: Optional dictionary to filter by metadata (e.g., {'episode_id': '...'}).
     """
-    vector_store = get_vector_store()
+    vector_store = vector_store or get_vector_store()
     
     types = allowed_types or list(DEFAULT_SEGMENT_TYPES)
     # Prefer server-side filtering, but fall back to client-side if the backend doesn't support $in.
@@ -79,12 +82,13 @@ def query_summaries(
     k: int = 5,
     *,
     allowed_types: Optional[List[str]] = None,
+    vector_store: Optional[Chroma] = None,
 ) -> List[Document]:
     """
     Search for episode and series summaries.
     Excludes transcript segments to focus on high-level content.
     """
-    vector_store = get_vector_store()
+    vector_store = vector_store or get_vector_store()
 
     # Summary-like doc types across audio + Substack + YouTube. Keep this conservative so
     # "summaries" doesn't accidentally return full article/transcript text.
@@ -106,6 +110,7 @@ def update_chroma_db(
     include_articles: bool = True,
     include_youtube: bool = False,
     confirm_reset: str | None = None,
+    prune_stale: bool = False,
 ):
     """Backwards-compatible wrapper for pipeline indexing.
 
@@ -120,11 +125,36 @@ def update_chroma_db(
         include_articles=include_articles,
         include_youtube=include_youtube,
         confirm_reset=confirm_reset,
+        prune_stale=prune_stale,
     )
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate embeddings for Knowledge Engine.")
     parser.add_argument("--reset", action="store_true", help="Delete existing ChromaDB collection before starting")
+    parser.add_argument(
+        "--prune-stale",
+        action="store_true",
+        help=(
+            "Delete segment rows for collected sources that on-disk artifacts no longer "
+            "produce. This CLI still collects audio and Substack by default, so prune "
+            "deletes those types too. For a youtube-only pass (e.g. after a YouTube "
+            "document-id change), use python -m src.pipeline.youtube.run --prune-stale-chroma. "
+            "Only safe when this machine holds the complete artifact set for the sources "
+            "being collected."
+        ),
+    )
+    parser.add_argument(
+        "--include-youtube",
+        action="store_true",
+        help=(
+            "Also collect/index YouTube documents (required to prune "
+            "youtube_transcript_segment rows). Does not turn off audio/Substack collection."
+        ),
+    )
     args = parser.parse_args()
-    
-    update_chroma_db(args.reset)
+
+    update_chroma_db(
+        args.reset,
+        include_youtube=args.include_youtube,
+        prune_stale=args.prune_stale,
+    )

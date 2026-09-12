@@ -109,7 +109,9 @@ def get_sqlite_checkpointer(
         return _savers[resolved]  # type: ignore[return-value]
 
     Path(resolved).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(resolved, check_same_thread=False)
+    conn = sqlite3.connect(resolved, check_same_thread=False, timeout=30.0)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     saver = DurableSqliteSaver(conn)
     saver.setup()
     if cache:

@@ -10,6 +10,7 @@ import json
 import os
 import uuid
 from typing import Any, Iterable
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from langchain.messages import AIMessage, HumanMessage, ToolMessage
@@ -106,7 +107,13 @@ def parse_structured_payload(raw: Any) -> list[SourceChunk]:
 def source_chunk_to_card(chunk: SourceChunk) -> dict[str, Any]:
     """Map a SourceChunk to the JSON object rendered as a source card."""
     dumped = chunk.model_dump()
-    return {field: dumped.get(field) for field in SOURCE_CARD_FIELDS}
+    card = {field: dumped.get(field) for field in SOURCE_CARD_FIELDS}
+    url = card.get("canonical_url")
+    if isinstance(url, str) and url.strip():
+        scheme = urlparse(url.strip()).scheme.lower()
+        if scheme not in {"http", "https"}:
+            card["canonical_url"] = None
+    return card
 
 
 def _dedupe_chunks(chunks: Iterable[SourceChunk]) -> list[SourceChunk]:

@@ -16,6 +16,12 @@ from src.pipeline.youtube.llm_config import DEFAULT_MODEL, get_segmentation_llm
 SHORT_WORD_THRESHOLD = 200
 SHORT_DURATION_THRESHOLD = 120.0
 
+# Chars of formatted transcript per segmentation call. An hour-plus video would
+# otherwise go out as one ~170k-char prompt and reliably hit the LLM timeout,
+# and run.py's per-video `except` would leave it unsegmented. Windowing keeps the
+# tail of the video visible, which truncating to a prefix would not.
+SEGMENTATION_PROMPT_BUDGET = 120_000
+
 
 class TopicSegment(BaseModel):
     topic_label: str = Field(description="A concise label for the topic discussed in this segment")
@@ -46,6 +52,29 @@ def _format_transcript(entries: list[dict[str, Any]]) -> str:
 
 def _word_count(entries: list[dict[str, Any]]) -> int:
     return len(" ".join(e.get("text") or "" for e in entries).split())
+
+
+def _budget_windows(
+    entries: list[dict[str, Any]], budget: int = SEGMENTATION_PROMPT_BUDGET
+) -> list[list[dict[str, Any]]]:
+    """Split entries into consecutive windows whose formatted text fits `budget`.
+
+    Everything shorter than one budget stays a single window, so the common case
+    is one call with the prompt it had before.
+    """
+    windows: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    size = 0
+    for entry in entries:
+        line = len(_format_transcript([entry]))
+        if current and size + line > budget:
+            windows.append(current)
+            current, size = [], 0
+        current.append(entry)
+        size += line
+    if current:
+        windows.append(current)
+    return windows
 
 
 def _single_segment(
@@ -129,7 +158,7 @@ def segment_video(
     transcript_path = YOUTUBE_TRANSCRIPTS_DIR / f"{video_id}.json"
     data = _load_json(transcript_path)
     entries = list(data.get("transcript") or [])
-    duration = duration_seconds
+    duration: float | None = duration_seconds
     if duration is None:
         raw = data.get("meta_data", {}).get("duration_seconds")
         try:
@@ -166,14 +195,17 @@ Guidelines:
             ]
         )
         chain = prompt | llm | parser
-        result = chain.invoke(
-            {
-                "title": title,
-                "transcript": _format_transcript(entries),
-                "format_instructions": parser.get_format_instructions(),
-            }
-        )
-        processed = _attach_content(result.segments, entries)
+        topic_segments: list[TopicSegment] = []
+        for window in _budget_windows(entries):
+            result = chain.invoke(
+                {
+                    "title": title,
+                    "transcript": _format_transcript(window),
+                    "format_instructions": parser.get_format_instructions(),
+                }
+            )
+            topic_segments.extend(result.segments)
+        processed = _attach_content(topic_segments, entries)
         if not processed:
             processed = _single_segment(title=title, entries=entries)
 

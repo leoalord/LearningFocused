@@ -15,11 +15,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from src.pipeline.audio.episode_ids import UNKNOWN_EPISODE_ID, parse_episode_id
+
 MISS_NOT_IN_CORPUS = "not_in_corpus"
 MISS_RETRIEVER_FAILED = "retriever_failed"
 
-_EPISODE_IN_FILENAME = re.compile(r"^(S2E\d+|S E\d+)\b")
-_UNIQUE_EPISODE_ID = re.compile(r"^S\d*E\d+$")
+_EPISODE_SEARCH = re.compile(r"S\d*\s?E\d+", re.IGNORECASE)
+_WELL_FORMED_EPISODE_ID = re.compile(r"^S\d*E\d+$", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -74,12 +76,22 @@ def load_gold_questions(path: Path) -> list[GoldQuestion]:
         if not isinstance(obj, Mapping):
             raise ValueError(f"Gold item {i} is not an object")
         must = obj.get("must_include")
-        if not isinstance(must, list) or not all(isinstance(p, str) for p in must):
+        if (
+            not isinstance(must, list)
+            or not must
+            or not all(isinstance(p, str) and p.strip() for p in must)
+        ):
             raise ValueError(f"Gold item {obj.get('id', i)} has invalid must_include")
+        item_id = obj.get("id")
+        question = obj.get("question")
+        if not item_id or not isinstance(item_id, str):
+            raise ValueError(f"Gold item {i} is missing id")
+        if not question or not isinstance(question, str):
+            raise ValueError(f"Gold item {i} is missing question")
         items.append(
             GoldQuestion(
-                id=str(obj["id"]),
-                question=str(obj["question"]),
+                id=str(item_id),
+                question=str(question),
                 must_include=tuple(must),
                 source_hint=str(obj.get("source_hint") or ""),
             )
@@ -119,9 +131,9 @@ def parse_source_hint(source_hint: str) -> SourceHintInfo:
         if "/" in part and not part.startswith("podcast ") and not part.startswith("substack "):
             paths.append(part)
             name = Path(part).name
-            ep = _EPISODE_IN_FILENAME.match(name)
-            if ep and episode_token is None:
-                episode_token = ep.group(1)
+            ep = parse_episode_id(name)
+            if ep != UNKNOWN_EPISODE_ID and episode_token is None:
+                episode_token = ep
             stem = Path(part).stem
             if part.startswith("substack_articles/") or part.startswith("article_summaries/"):
                 if stem.endswith("_summary"):
@@ -129,9 +141,13 @@ def parse_source_hint(source_hint: str) -> SourceHintInfo:
                 doc_id = stem
     if episode_token is None:
         head = parts[0] if parts else source_hint
-        m = re.search(r"\b(S2E\d+|S E\d+)\b", head)
-        if m:
-            episode_token = m.group(1)
+        parsed = parse_episode_id(head)
+        if parsed != UNKNOWN_EPISODE_ID:
+            episode_token = parsed
+        else:
+            m = _EPISODE_SEARCH.search(head)
+            if m:
+                episode_token = m.group(0).strip()
     return SourceHintInfo(
         raw=source_hint,
         artifact_paths=tuple(paths),
@@ -140,37 +156,45 @@ def parse_source_hint(source_hint: str) -> SourceHintInfo:
     )
 
 
-def is_unique_episode_id(episode_id: str | None) -> bool:
+def is_well_formed_episode_id(episode_id: str | None) -> bool:
+    """True if `episode_id` looks like `S2E335` / `S E18`. Not a uniqueness check."""
     if not episode_id:
         return False
-    return bool(_UNIQUE_EPISODE_ID.fullmatch(episode_id.replace(" ", "")))
+    return bool(_WELL_FORMED_EPISODE_ID.fullmatch(episode_id.replace(" ", "")))
+
+
+def is_unique_episode_id(episode_id: str | None) -> bool:
+    return is_well_formed_episode_id(episode_id)
 
 
 def hinted_artifact_text(path: Path) -> str:
     if not path.exists() or not path.is_file():
         return ""
-    if path.suffix.lower() == ".md":
-        return path.read_text(encoding="utf-8")
-    if path.suffix.lower() == ".json":
-        data = json.loads(path.read_text(encoding="utf-8"))
-        chunks: list[str] = []
-        if isinstance(data, dict):
-            title = data.get("title")
-            if title:
-                chunks.append(str(title))
-            for seg in data.get("segments") or []:
-                if not isinstance(seg, dict):
-                    continue
-                chunks.append(str(seg.get("topic") or ""))
-                chunks.append(str(seg.get("summary") or ""))
-                chunks.append(str(seg.get("content") or ""))
-            generated = data.get("generated_content")
-            if isinstance(generated, dict):
-                chunks.append(json.dumps(generated, ensure_ascii=False))
-        else:
-            chunks.append(json.dumps(data, ensure_ascii=False))
-        return "\n".join(chunks)
-    return path.read_text(encoding="utf-8", errors="replace")
+    try:
+        if path.suffix.lower() == ".md":
+            return path.read_text(encoding="utf-8", errors="replace")
+        if path.suffix.lower() == ".json":
+            data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+            chunks: list[str] = []
+            if isinstance(data, dict):
+                title = data.get("title")
+                if title:
+                    chunks.append(str(title))
+                for seg in data.get("segments") or []:
+                    if not isinstance(seg, dict):
+                        continue
+                    chunks.append(str(seg.get("topic") or ""))
+                    chunks.append(str(seg.get("summary") or ""))
+                    chunks.append(str(seg.get("content") or ""))
+                generated = data.get("generated_content")
+                if isinstance(generated, dict):
+                    chunks.append(json.dumps(generated, ensure_ascii=False))
+            else:
+                chunks.append(json.dumps(data, ensure_ascii=False))
+            return "\n".join(chunks)
+        return path.read_text(encoding="utf-8", errors="replace")
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return ""
 
 
 def phrases_present_in_text(*, must_include: Sequence[str], text: str) -> bool:
@@ -229,6 +253,6 @@ def hinted_source_retrieved(
         return True
     if hinted_title and hinted_title in titles:
         return True
-    if hint.episode_token and is_unique_episode_id(hint.episode_token) and hint.episode_token in episode_ids:
+    if hint.episode_token and is_well_formed_episode_id(hint.episode_token) and hint.episode_token in episode_ids:
         return True
     return False

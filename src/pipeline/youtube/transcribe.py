@@ -15,9 +15,13 @@ from src.config import YOUTUBE_TRANSCRIPTS_DIR, ensure_data_dirs
 
 
 _TS_RE = re.compile(
-    r"(?:(\d{2}):)?(\d{2}):(\d{2})[.,](\d{3})\s+-->\s+(?:(\d{2}):)?(\d{2}):(\d{2})[.,](\d{3})"
+    r"(?:(\d{1,3}):)?(\d{2}):(\d{2})[.,](\d{3})\s+-->\s+(?:(\d{1,3}):)?(\d{2}):(\d{2})[.,](\d{3})"
 )
 _TAG_RE = re.compile(r"<[^>]+>")
+
+# A cue can only overlap the text immediately before it, so the comparison window
+# stays bounded rather than growing with the transcript.
+_OVERLAP_WINDOW_WORDS = 120
 
 
 def _ts_to_seconds(h: str | None, m: str, s: str, ms: str) -> float:
@@ -40,7 +44,11 @@ def parse_vtt(text: str) -> list[dict[str, Any]]:
         end = _ts_to_seconds(match.group(5), match.group(6), match.group(7), match.group(8))
         i += 1
         text_lines: list[str] = []
-        while i < len(lines) and lines[i].strip():
+        # Only a truly empty line ends a cue payload. YouTube writes a whitespace-only
+        # line at the top of each body, so stripping first would drop the whole cue.
+        while i < len(lines) and lines[i] != "":
+            if _TS_RE.search(lines[i]):
+                break
             cleaned = _TAG_RE.sub("", lines[i]).strip()
             if cleaned and cleaned.upper() != "WEBVTT":
                 text_lines.append(cleaned)
@@ -51,38 +59,38 @@ def parse_vtt(text: str) -> list[dict[str, Any]]:
     return _dedupe_rolling_cues(cues)
 
 
+def _leading_overlap(tail: list[str], words: list[str]) -> int:
+    """How many leading `words` the already-emitted `tail` ends with."""
+    for k in range(min(len(words), len(tail)), 0, -1):
+        if tail[-k:] == words[:k]:
+            return k
+    return 0
+
+
 def _dedupe_rolling_cues(cues: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """YouTube auto VTT repeats rolling phrases; keep new tail text when possible."""
-    if not cues:
-        return []
+    """Collapse YouTube roll-up captions into a transcript that says each line once.
+
+    Roll-up auto-subs restate the whole visible window on every cue, so a line
+    arrives twice: a wide cue holding `<previous line> <new line>`, then a ~10ms
+    "flush" cue holding only `<new line>`. Matching each cue against the words
+    already *emitted* — rather than against the previous raw cue — is what makes
+    both shapes collapse, and it generalizes to windows more than two lines tall.
+    """
     out: list[dict[str, Any]] = []
-    prev_text = ""
+    tail: list[str] = []  # casefolded words already emitted
     for cue in cues:
-        text = " ".join((cue.get("text") or "").split())
-        if not text:
+        words = (cue.get("text") or "").split()
+        if not words:
             continue
-        if text == prev_text:
+        keys = [w.casefold() for w in words]
+        start = _leading_overlap(tail, keys)
+        if start == len(words):
+            # Entirely restated text: stretch the previous cue over its timespan.
             if out:
                 out[-1]["end_time"] = cue["end_time"]
             continue
-        if prev_text and text.startswith(prev_text):
-            addition = text[len(prev_text) :].strip()
-            if addition:
-                cue = {**cue, "text": addition}
-            else:
-                if out:
-                    out[-1]["end_time"] = cue["end_time"]
-                continue
-        elif prev_text and prev_text in text:
-            # Rolling caption grew in the middle; take the suffix after prev.
-            idx = text.find(prev_text)
-            addition = (text[:idx] + text[idx + len(prev_text) :]).strip()
-            if addition:
-                cue = {**cue, "text": addition}
-            else:
-                continue
-        out.append({**cue, "text": " ".join((cue.get("text") or "").split())})
-        prev_text = text
+        out.append({**cue, "text": " ".join(words[start:])})
+        tail = (tail + keys[start:])[-_OVERLAP_WINDOW_WORDS:]
     return out
 
 
@@ -121,13 +129,13 @@ def transcribe_from_captions(video_id: str, caption_path: Path) -> Path:
     return write_transcript(video_id, payload)
 
 
-def transcribe_from_audio(video_id: str, audio_path: Path) -> Path:
+def transcribe_from_audio(video_id: str, audio_path: Path, *, force: bool = False) -> Path:
     """AssemblyAI transcription of unique YT audio only (not podcast RSS files)."""
     from src.pipeline.audio.transcribe import transcribe_audio
 
     ensure_data_dirs()
     existing = YOUTUBE_TRANSCRIPTS_DIR / f"{video_id}.json"
-    if existing.exists():
+    if existing.exists() and not force:
         return existing
     out = transcribe_audio(str(audio_path), output_dir=str(YOUTUBE_TRANSCRIPTS_DIR))
     path = Path(out)

@@ -43,3 +43,6 @@ analysis_outputs/
 
 # LangGraph react-agent conversation checkpoints (TASK-7)
 .checkpoints/
+
+# Generated eval report (shape lives in last_report.example.json)
+evals/last_report.json

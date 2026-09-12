@@ -1,7 +1,7 @@
 """YouTube pipeline -> Chroma indexing helpers.
 
 Document ids (idempotency):
-  youtube_transcript_segment_{video_id}_{start_seconds_or_chunk}
+  youtube_transcript_segment_{video_id}_{start_seconds_or_chunk}_{topic}
   youtube_summary_overview_{video_id}
 """
 
@@ -128,11 +128,12 @@ def create_segment_documents(segmented: dict[str, Any]) -> list[Document]:
         summary = segment.get("summary") or ""
         start_time = segment.get("start_time")
         end_time = segment.get("end_time")
+        # Keep full precision and include the topic, matching the podcast id scheme:
+        # truncating to whole seconds collapsed segments under 1s apart onto one id.
         try:
-            start_int = int(float(start_time)) if start_time is not None else None
+            chunk_key = f"{float(start_time):.2f}" if start_time is not None else f"{idx:03d}"
         except (TypeError, ValueError):
-            start_int = None
-        chunk_key = f"{start_int}" if start_int is not None else f"{idx:03d}"
+            chunk_key = f"{idx:03d}"
         page = f"YouTube: {title}\nTopic: {topic}\nSummary: {summary}\n\nTranscript:\n{content}"
         meta = _base_meta(
             video_id,
@@ -147,23 +148,31 @@ def create_segment_documents(segmented: dict[str, Any]) -> list[Document]:
         )
         meta["type"] = "youtube_transcript_segment"
         doc = Document(page_content=page, metadata=meta)
-        doc.metadata["_chroma_id"] = f"youtube_transcript_segment_{video_id}_{chunk_key}"
+        doc.metadata["_chroma_id"] = f"youtube_transcript_segment_{video_id}_{chunk_key}_{topic}"
         documents.append(doc)
     return documents
 
 
-def collect_youtube_documents() -> list[Document]:
+def collect_youtube_documents(unreadable: list[str] | None = None) -> list[Document]:
+    """Collect YouTube Documents, recording unreadable artifacts in `unreadable`.
+
+    See `collect_audio_documents` for why callers that prune need that signal.
+    """
     documents: list[Document] = []
     if YOUTUBE_SUMMARIES_DIR.exists():
         for path in sorted(YOUTUBE_SUMMARIES_DIR.glob("*.json")):
             try:
                 documents.append(create_summary_document(_load_json(path)))
-            except Exception:
+            except Exception as exc:
+                if unreadable is not None:
+                    unreadable.append(f"{path}: {exc}")
                 continue
     if YOUTUBE_SEGMENTED_DIR.exists():
         for path in sorted(YOUTUBE_SEGMENTED_DIR.glob("*.json")):
             try:
                 documents.extend(create_segment_documents(_load_json(path)))
-            except Exception:
+            except Exception as exc:
+                if unreadable is not None:
+                    unreadable.append(f"{path}: {exc}")
                 continue
     return documents

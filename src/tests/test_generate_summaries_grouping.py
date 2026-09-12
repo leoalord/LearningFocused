@@ -8,8 +8,11 @@ from unittest.mock import patch
 
 from src.pipeline.audio.generate_summaries import (
     EpisodeGroup,
+    _is_grouping_timeout,
     episode_sort_key,
+    filename_title_key,
     group_episodes,
+    identical_title_groups,
     iter_grouping_batches,
     merge_and_dedupe_groups,
 )
@@ -69,6 +72,13 @@ class TestMergeAndDedupeGroups(unittest.TestCase):
         self.assertEqual(len([g for g in merged if "S2E58.json" in g.filenames]), 1)
         self.assertEqual(len([g for g in merged if "S2E62.json" in g.filenames]), 1)
 
+    def test_complete_seven_part_series_is_not_truncated(self) -> None:
+        files = [f"S2E{i}.json" for i in range(1, 8)]
+        groups = [_group("parts-1-7", *[f"S2E{i}.json" for i in range(1, 8)])]
+        merged = merge_and_dedupe_groups(files, groups)
+        series = next(g for g in merged if g.group_id == "parts-1-7")
+        self.assertEqual(len(series.filenames), 7)
+
     def test_drops_hallucinated_filenames_and_fills_missing_as_singletons(self) -> None:
         files = ["S2E1.json", "S2E2.json", "S2E3.json"]
         groups = [_group("invented", "S2E1.json", "S2E999.json")]
@@ -80,13 +90,54 @@ class TestMergeAndDedupeGroups(unittest.TestCase):
         self.assertEqual(by_file["S2E2.json"].filenames, ["S2E2.json"])
         self.assertEqual(by_file["S2E3.json"].filenames, ["S2E3.json"])
 
+    def test_partial_overlap_does_not_fuse_two_series(self) -> None:
+        files = [f"S2E{i}.json" for i in range(4, 9)]
+        groups = [
+            _group("topicX", "S2E4.json", "S2E5.json", "S2E6.json"),
+            _group("topicY", "S2E6.json", "S2E7.json", "S2E8.json"),
+        ]
+        merged = merge_and_dedupe_groups(files, groups)
+        by_id = {g.group_id: set(g.filenames) for g in merged}
+        self.assertEqual(by_id["topicX"], {"S2E4.json", "S2E5.json", "S2E6.json"})
+        self.assertEqual(by_id["topicY"], {"S2E7.json", "S2E8.json"})
+        assigned = [name for group in merged for name in group.filenames]
+        self.assertEqual(sorted(assigned), sorted(files))
+
+    def test_identical_titles_lock_across_sort_distance(self) -> None:
+        files = [
+            "S E17 How to Use 2Hr Learning.json",
+            "S E18 Other.json",
+            "S E152 How to Use 2Hr Learning.json",
+        ]
+        locked = identical_title_groups(files)
+        self.assertEqual(len(locked), 1)
+        merged = merge_and_dedupe_groups(files, [_group("solo", "S E18 Other.json")], locked=locked)
+        pair = next(g for g in merged if len(g.filenames) == 2)
+        self.assertEqual(
+            set(pair.filenames),
+            {"S E17 How to Use 2Hr Learning.json", "S E152 How to Use 2Hr Learning.json"},
+        )
+
+    def test_timeout_matcher_ignores_token_counts(self) -> None:
+        self.assertFalse(_is_grouping_timeout(RuntimeError("requested 15042 tokens")))
+        self.assertTrue(_is_grouping_timeout(TimeoutError("timed out")))
+        err = RuntimeError("gateway timeout")
+        err.status_code = 504  # type: ignore[attr-defined]
+        self.assertTrue(_is_grouping_timeout(err))
+
+    def test_filename_title_key_strips_episode_token(self) -> None:
+        self.assertEqual(
+            filename_title_key("S E17 How to Use 2Hr Learning.json"),
+            filename_title_key("S E152 How to Use 2Hr Learning.json"),
+        )
+
 
 class TestGroupEpisodesBatching(unittest.TestCase):
     def test_group_episodes_invokes_one_llm_batch_at_a_time(self) -> None:
         files = [f"S2E{i:03d}.json" for i in range(1, 121)]
         seen_sizes: list[int] = []
 
-        def fake_batch(episodes_context, llm):
+        def fake_batch(episodes_context, llm, failures=None):
             names = [item["filename"] for item in episodes_context]
             seen_sizes.append(len(names))
             self.assertLessEqual(len(names), 60)

@@ -54,8 +54,19 @@ class TestSourceChunkMapping(unittest.TestCase):
         self.assertEqual(card["snippet"], "Mastery in two hours a day.")
         self.assertEqual(card["kind"], "transcript_segment")
 
+    def test_javascript_canonical_url_is_dropped(self) -> None:
+        chunk = SourceChunk(
+            kind="transcript_segment",
+            title="Two Hour Learning",
+            canonical_url="javascript:alert(1)",
+            episode_id="ep-42",
+            snippet="Mastery in two hours a day.",
+        )
+        card = source_chunk_to_card(chunk)
+        self.assertIsNone(card["canonical_url"])
+
     def test_parse_structured_search_json(self) -> None:
-        payload = {
+        payload: dict = {
             "summaries": [
                 {
                     "kind": "key_takeaway",

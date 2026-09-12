@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -71,7 +72,16 @@ def yt_dlp_flat(url: str) -> list[dict]:
         "--no-warnings",
         url,
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    try:
+        timeout = max(1, int(os.environ.get("LF_YTDLP_TIMEOUT_SECONDS", "300") or "300"))
+    except ValueError:
+        timeout = 300
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, check=False, timeout=timeout
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"yt-dlp timed out after {timeout}s for {url}") from exc
     if proc.returncode != 0:
         raise RuntimeError(f"yt-dlp failed for {url}:\n{proc.stderr[-2000:]}")
     items = []

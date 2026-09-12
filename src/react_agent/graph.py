@@ -29,8 +29,16 @@ from src.react_agent.utils import create_chat_model
 from src.react_agent.prompts import system_prompt
 from src.react_agent.checkpointer import get_sqlite_checkpointer
 
-# Production checkpointer: SQLite on a gitignored path (not MemorySaver).
-memory = get_sqlite_checkpointer()
+_memory = None
+_react_agent = None
+
+
+def _default_memory():
+    """Open SQLite on first use so importing the package does not create files."""
+    global _memory
+    if _memory is None:
+        _memory = get_sqlite_checkpointer()
+    return _memory
 
 
 def get_react_agent(
@@ -66,7 +74,7 @@ def get_react_agent(
         model,
         tools=tools,
         system_prompt=system_prompt,
-        checkpointer=checkpointer if checkpointer is not None else memory,
+        checkpointer=checkpointer if checkpointer is not None else _default_memory(),
     )
 
     # Respect configured iteration limits; default to Configuration.max_iterations
@@ -79,5 +87,12 @@ def get_react_agent(
     return agent.with_config(recursion_limit=recursion_limit)
 
 
-# Create default agent instance with durable SQLite checkpointer
-react_agent = get_react_agent(checkpointer=memory)
+def __getattr__(name: str) -> Any:
+    global _react_agent
+    if name == "memory":
+        return _default_memory()
+    if name == "react_agent":
+        if _react_agent is None:
+            _react_agent = get_react_agent()
+        return _react_agent
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

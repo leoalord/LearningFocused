@@ -7,8 +7,10 @@ Never downloads a full MP4; audio extract is m4a only when captions are missing.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -25,6 +27,9 @@ from src.pipeline.youtube.constants import (
 )
 
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+YTDLP_TIMEOUT_ENV = "LF_YTDLP_TIMEOUT_SECONDS"
+DEFAULT_YTDLP_TIMEOUT = 300
 
 _FORBIDDEN_URL_NEEDLES = (
     "thealphaschool",
@@ -63,9 +68,25 @@ def assert_safe_url(url: str) -> str:
     return url
 
 
+def _yt_dlp_timeout() -> int:
+    try:
+        return max(1, int(os.environ.get(YTDLP_TIMEOUT_ENV, "") or DEFAULT_YTDLP_TIMEOUT))
+    except ValueError:
+        return DEFAULT_YTDLP_TIMEOUT
+
+
 def _run_yt_dlp(args: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
     cmd = ["yt-dlp", *args]
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    # stdout is captured, so a throttle-wait would otherwise hang with no output.
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, check=False, timeout=_yt_dlp_timeout()
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"yt-dlp timed out after {_yt_dlp_timeout()}s "
+            f"(raise ${YTDLP_TIMEOUT_ENV} if this is a slow network)"
+        ) from exc
     if check and proc.returncode != 0:
         raise RuntimeError(f"yt-dlp failed ({proc.returncode}): {proc.stderr[-3000:]}")
     return proc
@@ -124,13 +145,17 @@ def find_caption_file(video_id: str) -> Path | None:
     if not matches:
         return None
 
-    def _rank(p: Path) -> tuple[int, str]:
-        name = p.name.lower()
-        # Prefer official over auto-generated.
-        auto = 1 if "auto" in name or "orig" in name else 0
-        return (auto, name)
+    def _rank(p: Path) -> tuple[int, int, str]:
+        # `<vid>.en.vtt` -> "en"; `<vid>.en-en-nP7-2PuUl7o.vtt` -> "en-en-nP7-2PuUl7o".
+        tag = p.name[len(video_id) :].removesuffix(".vtt").lstrip(".").lower()
+        # Prefer official over auto-generated, then the shortest language tag.
+        # Plain `en` is YouTube's own ASR track; hashed per-track variants are often
+        # third-party broadcast feeds that start late and arrive in all caps. Ranking
+        # on name alone sorted `-` before `.`, so those variants always won.
+        auto = 1 if "auto" in tag or "orig" in tag else 0
+        return (auto, len(tag), tag)
 
-    return sorted(matches, key=_rank)[0]
+    return min(matches, key=_rank)
 
 
 def download_captions(video_id: str) -> Path | None:
@@ -140,7 +165,7 @@ def download_captions(video_id: str) -> Path | None:
     if existing:
         return existing
     out_tmpl = str(YOUTUBE_CAPTIONS_DIR / vid)
-    _run_yt_dlp(
+    proc = _run_yt_dlp(
         [
             "--write-subs",
             "--write-auto-subs",
@@ -157,7 +182,14 @@ def download_captions(video_id: str) -> Path | None:
         ],
         check=False,
     )
-    return find_caption_file(vid)
+    found = find_caption_file(vid)
+    if found is None and proc.returncode != 0:
+        print(
+            f"Caption download failed for {vid} (yt-dlp {proc.returncode}); "
+            f"will fall back to audio if needed. {proc.stderr[-500:]}",
+            file=sys.stderr,
+        )
+    return found
 
 
 def find_audio_file(video_id: str) -> Path | None:
@@ -201,10 +233,12 @@ def download_audio_extract(video_id: str) -> Path:
 def compact_info(raw: dict[str, Any]) -> dict[str, Any]:
     video_id = str(raw.get("id") or raw.get("video_id") or "")
     duration = raw.get("duration")
-    try:
-        duration_seconds = int(duration) if duration not in (None, "", "NA") else None
-    except (TypeError, ValueError):
-        duration_seconds = None
+    duration_seconds: int | None = None
+    if duration is not None and duration not in ("", "NA"):
+        try:
+            duration_seconds = int(duration)
+        except (TypeError, ValueError):
+            duration_seconds = None
     channel_id = raw.get("channel_id") or raw.get("uploader_id") or ""
     channel = raw.get("channel") or raw.get("uploader") or ""
     handle = raw.get("uploader_id") or raw.get("channel") or ""

@@ -13,7 +13,7 @@ so the same conversation survives process restart:
     )
 """
 
-from src.react_agent.graph import react_agent, get_react_agent, memory
+from src.react_agent.graph import get_react_agent
 from src.react_agent.checkpointer import get_sqlite_checkpointer
 from src.react_agent.configuration import Configuration
 from src.react_agent.tools import (
@@ -36,3 +36,11 @@ __all__ = [
     "query_knowledge_graph",
     "inspect_graph_schema",
 ]
+
+
+def __getattr__(name: str):
+    if name in ("react_agent", "memory"):
+        from src.react_agent import graph as _graph
+
+        return getattr(_graph, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

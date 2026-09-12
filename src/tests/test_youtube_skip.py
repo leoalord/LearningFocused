@@ -96,6 +96,28 @@ class TestYoutubeSkipRules(unittest.TestCase):
         )
         self.assertIsNone(decision)
 
+    def test_one_shared_generic_token_is_not_a_title_cue(self) -> None:
+        rss = [_rss("S2E123: The School That Actually Works For Boys", "00:15:02")]
+        decision = skip_decision(
+            video_id="meetSchool1",
+            title="Meet The School With No Teachers",
+            duration_seconds=900,
+            rss_entries=rss,
+            episodes_playlist_ids=set(),
+        )
+        self.assertIsNone(decision)
+
+    def test_short_titles_sharing_one_token_are_not_skipped(self) -> None:
+        rss = [_rss("The School", "00:15:00")]
+        decision = skip_decision(
+            video_id="schoolBoys1",
+            title="The School For Boys",
+            duration_seconds=900,
+            rss_entries=rss,
+            episodes_playlist_ids=set(),
+        )
+        self.assertIsNone(decision)
+
     def test_offchannel_appearance_duration_collision_not_skipped(self) -> None:
         rss = [_rss("S2E234: Alpha Dads Talk Alternative Education (Part 1)", "00:23:59")]
         decision = skip_decision(

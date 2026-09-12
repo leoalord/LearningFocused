@@ -25,15 +25,16 @@ from evals.scoring import (
     concatenate_retrieved_text,
     hinted_artifact_text,
     hinted_source_retrieved,
-    is_unique_episode_id,
+    is_well_formed_episode_id,
     load_gold_questions,
     parse_source_hint,
     phrases_present_in_text,
+    retrieved_meta_ids,
     score_hit,
     slice_name,
 )
 from src.config import CHROMA_DIR, PROJECT_ROOT
-from src.database.chroma_manager import COLLECTION_NAME, query_segments, query_summaries
+from src.database.chroma_manager import COLLECTION_NAME, get_vector_store, query_segments, query_summaries
 
 DEFAULT_GOLD = PROJECT_ROOT / "evals" / "gold_questions.json"
 DEFAULT_REPORT = PROJECT_ROOT / "evals" / "last_report.json"
@@ -68,7 +69,8 @@ def _connect_collection():
 def _first_where(collection, where: dict[str, Any]) -> bool:
     try:
         res = collection.get(where=where, limit=1, include=["metadatas"])
-    except Exception:
+    except Exception as exc:
+        print(f"warning: metadata probe failed for {where}: {exc}", file=sys.stderr)
         return False
     return bool(res.get("ids"))
 
@@ -108,7 +110,7 @@ def inspect_corpus(
             if title:
                 status.hinted_title = str(title)
             eid = payload.get("episode_id")
-            if eid and is_unique_episode_id(str(eid)):
+            if eid and is_well_formed_episode_id(str(eid)):
                 status.hinted_episode_id = str(eid)
             doc_id = payload.get("doc_id")
             if doc_id:
@@ -124,23 +126,13 @@ def inspect_corpus(
     indexed = False
     if status.hinted_doc_id:
         indexed = indexed or _first_where(collection, {"doc_id": status.hinted_doc_id})
-    if status.hinted_episode_id and is_unique_episode_id(status.hinted_episode_id):
-        indexed = indexed or _first_where(collection, {"episode_id": status.hinted_episode_id})
     if status.hinted_title:
         indexed = indexed or _first_where(collection, {"title": status.hinted_title})
+    if status.hinted_episode_id and is_well_formed_episode_id(status.hinted_episode_id):
+        indexed = indexed or _first_where(collection, {"episode_id": status.hinted_episode_id})
     status.indexed = indexed
 
-    episode_ids: list[str] = []
-    doc_ids: list[str] = []
-    for meta in retrieved_metadatas:
-        eid = meta.get("episode_id")
-        if eid:
-            episode_ids.append(str(eid))
-        did = meta.get("doc_id")
-        if did:
-            doc_ids.append(str(did))
-    status.retrieved_episode_ids = episode_ids
-    status.retrieved_doc_ids = doc_ids
+    status.retrieved_episode_ids, status.retrieved_doc_ids = retrieved_meta_ids(retrieved_metadatas)
     status.hinted_source_in_results = hinted_source_retrieved(
         hint=hint,
         hinted_title=status.hinted_title,
@@ -149,9 +141,24 @@ def inspect_corpus(
     return status
 
 
+_EVAL_STORE = None
+
+
+def _read_only_store():
+    global _EVAL_STORE
+    if _EVAL_STORE is None:
+        _EVAL_STORE = get_vector_store(create_if_missing=False)
+    return _EVAL_STORE
+
+
 def retrieve(question: str, *, max_segments: int, max_summaries: int):
-    summaries = query_summaries(question, k=max_summaries) if max_summaries > 0 else []
-    segments = query_segments(query=question, k=max_segments) if max_segments > 0 else []
+    store = _read_only_store()
+    summaries = (
+        query_summaries(question, k=max_summaries, vector_store=store) if max_summaries > 0 else []
+    )
+    segments = (
+        query_segments(query=question, k=max_segments, vector_store=store) if max_segments > 0 else []
+    )
     return summaries, segments
 
 
@@ -171,11 +178,45 @@ def evaluate(
     slices: dict[str, dict[str, Any]] = {}
 
     for q in questions:
-        summaries, segments = retrieve(
-            q.question,
-            max_segments=max_segments,
-            max_summaries=max_summaries,
-        )
+        try:
+            summaries, segments = retrieve(
+                q.question,
+                max_segments=max_segments,
+                max_summaries=max_summaries,
+            )
+        except Exception as exc:
+            missed_ids.append(q.id)
+            miss_split["retriever_failed"] = miss_split.get("retriever_failed", 0) + 1
+            sl = slice_name(q.id)
+            bucket = slices.setdefault(sl, {"n": 0, "hits": 0, "missed_ids": []})
+            bucket["n"] += 1
+            bucket["missed_ids"].append(q.id)
+            per_question.append(
+                {
+                    "id": q.id,
+                    "question": q.question,
+                    "hit": False,
+                    "error": str(exc),
+                    "missing_phrases": list(q.must_include),
+                    "phrase_hits": {p: False for p in q.must_include},
+                    "miss_type": "retriever_failed",
+                    "retrieved_count": {"summaries": 0, "segments": 0},
+                    "retrieved_titles": [],
+                    "corpus": {
+                        "artifact_exists": {},
+                        "disk_present": False,
+                        "indexed": False,
+                        "phrases_in_hinted_source": False,
+                        "hinted_episode_id": None,
+                        "hinted_title": None,
+                        "hinted_doc_id": None,
+                        "retrieved_episode_ids": [],
+                        "retrieved_doc_ids": [],
+                        "hinted_source_in_results": False,
+                    },
+                }
+            )
+            continue
         docs = list(summaries) + list(segments)
         page_contents = [d.page_content or "" for d in docs]
         retrieved_text = concatenate_retrieved_text(page_contents)
@@ -194,7 +235,7 @@ def evaluate(
             miss_type = classify_miss(
                 disk_present=corpus.disk_present,
                 indexed=corpus.indexed,
-                phrases_in_corpus=corpus.phrases_in_hinted_source and corpus.indexed,
+                phrases_in_corpus=corpus.phrases_in_hinted_source,
             )
             missed_ids.append(q.id)
             miss_split[miss_type] = miss_split.get(miss_type, 0) + 1
@@ -305,6 +346,8 @@ def main(argv: list[str] | None = None) -> None:
     report_path = args.report if args.report.is_absolute() else PROJECT_ROOT / args.report
     if not gold_path.is_file():
         _fail(f"Gold set not found: {gold_path}")
+    if report_path.resolve() == gold_path.resolve():
+        _fail("--report must not point at the gold set")
     questions = load_gold_questions(gold_path)
     report = evaluate(
         questions,

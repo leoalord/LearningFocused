@@ -169,8 +169,10 @@
       function sourceLabel(src) {
         const title = src.title || src.group_title || "Untitled source";
         const episode = src.episode_id ? `<p class="source-meta source-episode">Episode: ${escapeHtml(src.episode_id)}</p>` : "";
-        const url = src.canonical_url
-          ? `<p class="source-meta source-url"><a href="${escapeHtml(src.canonical_url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(src.canonical_url)}</a></p>`
+        const rawUrl = typeof src.canonical_url === "string" ? src.canonical_url : "";
+        const safeUrl = /^https?:\/\//i.test(rawUrl) ? rawUrl : "";
+        const url = safeUrl
+          ? `<p class="source-meta source-url"><a href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(safeUrl)}</a></p>`
           : "";
         const topic = src.topic ? `<p class="source-meta">Topic: ${escapeHtml(src.topic)}</p>` : "";
         const snippet = src.snippet ? `<p class="source-snippet">${escapeHtml(src.snippet)}</p>` : "";

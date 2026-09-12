@@ -127,7 +127,7 @@ def create_transcript_documents(transcript_data: Dict[str, Any]) -> List[Documen
         # `key` disambiguates episodes that share an episode number (the feed reuses
         # `S E2` and `S2E215`), so segments from different recordings can't collide.
         # Fallback to topic index if start_time not available
-        segment_id = f"transcript_segment_{key}_{start_time or 'unknown'}_{topic}"
+        segment_id = f"transcript_segment_{key}_{start_time if start_time is not None else 'unknown'}_{topic}"
         documents.append(
             Document(
                 page_content=combined_text,
@@ -149,8 +149,13 @@ def create_transcript_documents(transcript_data: Dict[str, Any]) -> List[Documen
     return documents
 
 
-def collect_audio_documents() -> List[Document]:
-    """Collect all audio-derived Documents for Chroma indexing."""
+def collect_audio_documents(unreadable: List[str] | None = None) -> List[Document]:
+    """Collect all audio-derived Documents for Chroma indexing.
+
+    Unreadable artifacts are skipped, and their paths are appended to `unreadable`
+    when provided. Callers that prune Chroma by the ids collected here must treat a
+    non-empty list as "corpus incomplete" and not delete the rows they couldn't see.
+    """
     documents: List[Document] = []
 
     # Combined summaries
@@ -161,7 +166,9 @@ def collect_audio_documents() -> List[Document]:
                 try:
                     data = _load_json_file(path)
                     documents.extend(create_summary_documents(data))
-                except Exception:
+                except Exception as exc:
+                    if unreadable is not None:
+                        unreadable.append(f"{path}: {exc}")
                     continue
 
     # Segmented transcripts
@@ -172,7 +179,9 @@ def collect_audio_documents() -> List[Document]:
                 try:
                     data = _load_json_file(path)
                     documents.extend(create_transcript_documents(data))
-                except Exception:
+                except Exception as exc:
+                    if unreadable is not None:
+                        unreadable.append(f"{path}: {exc}")
                     continue
 
     return documents

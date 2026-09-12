@@ -12,7 +12,7 @@ Corpus: Future of Education podcast (Alpha School / Two Hour Learning) plus the 
 | `schema.example.json` | One-item copy of the schema for a later agent to copy |
 | `run.py` | Read-only eval runner (`uv run python -m evals.run`) |
 | `scoring.py` | Hit definition + miss classification helpers |
-| `last_report.json` | Latest run output (overwritten each run; keep committed as the sample) |
+| `last_report.json` | Latest run output (gitignored; overwritten each run) |
 | `last_report.example.json` | Tiny committed copy of the report shape |
 
 ## Item schema
@@ -45,7 +45,7 @@ Do not treat `source_hint` as a required metadata match for the official hit. Me
 
 ## Eval runner (TASK-11)
 
-Requires an existing on-disk Chroma store (`chroma_db/`) and embedding credentials in `.env`. The runner **does not** `--reset-chroma`, does not add documents, and does not run ingest pipelines.
+Requires an existing on-disk Chroma store (`chroma_db/`) and embedding credentials in `.env`. Each question issues billed `text-embedding-3-small` queries. The runner **does not** `--reset-chroma`, does not add documents, and does not run ingest pipelines. It opens the collection read-only (`create_collection_if_not_exists=False`) and does not create pipeline data directories.
 
 ```bash
 uv run python -m evals.run
