@@ -76,6 +76,23 @@ def _get_stream_mode() -> Union[str, Sequence[str]]:
     return tuple(parts) if parts else ("updates", "values")
 
 
+def _normalize_stream_item(chunk: Any) -> tuple[str | None, Any]:
+    """LangGraph yields `(mode, data)` when stream_mode is a sequence."""
+    if isinstance(chunk, tuple) and len(chunk) == 2 and isinstance(chunk[0], str):
+        return chunk[0], chunk[1]
+    return None, chunk
+
+
+def _values_messages(chunk: Any) -> list[BaseMessage] | None:
+    """Return the messages list from a values payload, or None to skip."""
+    mode, data = _normalize_stream_item(chunk)
+    if mode == "updates":
+        return None
+    if isinstance(data, dict) and "messages" in data:
+        return list(data.get("messages") or [])
+    return None
+
+
 async def run_turn(user_input: str, thread_id: str) -> None:
     """Run one turn through the agent.
     
@@ -104,35 +121,31 @@ async def run_turn(user_input: str, thread_id: str) -> None:
             config=run_config,
             stream_mode=stream_mode,
         ):
-            # stream_mode="values" yields {"messages": [...]}
-            if isinstance(chunk, dict) and "messages" in chunk:
-                chunk_messages = chunk.get("messages") or []
-                latest_messages = chunk_messages
+            chunk_messages = _values_messages(chunk)
+            if chunk_messages is None:
+                continue
+            latest_messages = chunk_messages
 
-                if last_seen is None:
-                    last_seen = _first_unseen_index(chunk_messages)
+            if last_seen is None:
+                last_seen = _first_unseen_index(chunk_messages)
 
-                # Only process new messages appended since last chunk
-                for msg in chunk_messages[last_seen:]:
-                    if isinstance(msg, ToolMessage):
-                        print(f"{COLOR_DIM}  └─ Result ({msg.name}): {_truncate(str(msg.content), 200)}{COLOR_RESET}")
-                    elif isinstance(msg, AIMessage):
-                        if getattr(msg, "tool_calls", None):
-                            for tc in msg.tool_calls:
-                                name = tc.get("name", "unknown")
-                                args = tc.get("args", {})
-                                print(f"{COLOR_TOOL}  ┌─ Call: {name}{COLOR_RESET}{COLOR_DIM}({args}){COLOR_RESET}")
-                        elif msg.content:
-                            final_response = msg.content
-                            print(f"\n{COLOR_SUCCESS}=== Agent Response ==={COLOR_RESET}")
-                            print(_format_ai_content(final_response))
-                            print(f"{COLOR_SUCCESS}======================{COLOR_RESET}\n")
+            # Only process new messages appended since last chunk
+            for msg in chunk_messages[last_seen:]:
+                if isinstance(msg, ToolMessage):
+                    print(f"{COLOR_DIM}  └─ Result ({msg.name}): {_truncate(str(msg.content), 200)}{COLOR_RESET}")
+                elif isinstance(msg, AIMessage):
+                    if getattr(msg, "tool_calls", None):
+                        for tc in msg.tool_calls:
+                            name = tc.get("name", "unknown")
+                            args = tc.get("args", {})
+                            print(f"{COLOR_TOOL}  ┌─ Call: {name}{COLOR_RESET}{COLOR_DIM}({args}){COLOR_RESET}")
+                    elif msg.content:
+                        final_response = msg.content
+                        print(f"\n{COLOR_SUCCESS}=== Agent Response ==={COLOR_RESET}")
+                        print(_format_ai_content(final_response))
+                        print(f"{COLOR_SUCCESS}======================{COLOR_RESET}\n")
 
-                last_seen = len(chunk_messages)
-
-            # stream_mode="updates" yields per-node updates like {"model": ...} / {"tools": ...}
-            elif isinstance(chunk, dict):
-                pass
+            last_seen = len(chunk_messages)
                 
     except GraphRecursionError as e:
         print(

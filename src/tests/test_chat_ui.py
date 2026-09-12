@@ -7,7 +7,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from langchain.messages import AIMessage, HumanMessage, ToolMessage
 
@@ -15,7 +15,9 @@ from src.deep_research_agent.tools import SourceChunk
 from src.ui.service import (
     SOURCE_CARD_FIELDS,
     ChatUIError,
+    arun_chat,
     chroma_preflight_error,
+    current_turn_messages,
     final_answer_from_messages,
     health_payload,
     llm_api_key_error,
@@ -126,6 +128,137 @@ class TestSourceChunkMapping(unittest.TestCase):
             final_answer_from_messages(messages),
             "Two Hour Learning is a school model.",
         )
+
+    def test_current_turn_drops_prior_search_hits(self) -> None:
+        prior_payload = {
+            "summaries": [],
+            "segments": [
+                {
+                    "kind": "transcript_segment",
+                    "title": "Prior episode",
+                    "canonical_url": "https://example.com/prior",
+                    "episode_id": "ep-old",
+                    "snippet": "old quote",
+                    "metadata": {},
+                }
+            ],
+        }
+        current_payload = {
+            "summaries": [],
+            "segments": [
+                {
+                    "kind": "transcript_segment",
+                    "title": "Current episode",
+                    "canonical_url": "https://example.com/now",
+                    "episode_id": "ep-new",
+                    "snippet": "new quote",
+                    "metadata": {},
+                }
+            ],
+        }
+        messages = [
+            HumanMessage(content="What is Two Hour Learning?"),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "search_knowledge_base_structured",
+                        "args": {"query": "Two Hour Learning"},
+                        "id": "call-1",
+                    }
+                ],
+            ),
+            ToolMessage(
+                content=json.dumps(prior_payload),
+                name="search_knowledge_base_structured",
+                tool_call_id="call-1",
+            ),
+            AIMessage(content="Two Hour Learning is a school model."),
+            HumanMessage(content="What is Alpha Anywhere?"),
+            AIMessage(content="Alpha Anywhere is a remote campus."),
+        ]
+        turn = current_turn_messages(messages)
+        self.assertEqual(turn[0].content, "What is Alpha Anywhere?")
+        self.assertEqual(sources_from_messages(turn), [])
+        self.assertEqual(tools_used_from_messages(turn), [])
+        self.assertEqual(
+            final_answer_from_messages(turn),
+            "Alpha Anywhere is a remote campus.",
+        )
+
+        with_search = messages[:-1] + [
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "search_knowledge_base_structured",
+                        "args": {"query": "Alpha Anywhere"},
+                        "id": "call-2",
+                    }
+                ],
+            ),
+            ToolMessage(
+                content=json.dumps(current_payload),
+                name="search_knowledge_base_structured",
+                tool_call_id="call-2",
+            ),
+            AIMessage(content="Alpha Anywhere is a remote campus."),
+        ]
+        turn = current_turn_messages(with_search)
+        chunks = sources_from_messages(turn)
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0].title, "Current episode")
+        self.assertNotIn("Prior episode", [c.title for c in chunks])
+
+
+class TestArunChatCurrentTurn(unittest.IsolatedAsyncioTestCase):
+    async def test_second_turn_without_search_is_not_tool_backed(self) -> None:
+        prior_payload = {
+            "summaries": [],
+            "segments": [
+                {
+                    "kind": "transcript_segment",
+                    "title": "Prior episode",
+                    "canonical_url": "https://example.com/prior",
+                    "episode_id": "ep-old",
+                    "snippet": "old quote",
+                    "metadata": {},
+                }
+            ],
+        }
+        history = [
+            HumanMessage(content="What is Two Hour Learning?"),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "search_knowledge_base_structured",
+                        "args": {"query": "Two Hour Learning"},
+                        "id": "call-1",
+                    }
+                ],
+            ),
+            ToolMessage(
+                content=json.dumps(prior_payload),
+                name="search_knowledge_base_structured",
+                tool_call_id="call-1",
+            ),
+            AIMessage(content="Two Hour Learning is a school model."),
+            HumanMessage(content="What is Alpha Anywhere?"),
+            AIMessage(content="Alpha Anywhere is a remote campus."),
+        ]
+        fake_agent = MagicMock()
+        fake_agent.ainvoke = AsyncMock(return_value={"messages": history})
+        with (
+            patch("src.ui.service.preflight"),
+            patch("src.react_agent.graph.react_agent", fake_agent),
+            patch("src.ui.service._fallback_structured_sources", return_value=[]),
+        ):
+            payload = await arun_chat("What is Alpha Anywhere?", thread_id="t-followup")
+        self.assertFalse(payload["tool_backed"])
+        self.assertEqual(payload["tools_used"], [])
+        self.assertEqual(payload["sources"], [])
+        self.assertEqual(payload["answer"], "Alpha Anywhere is a remote campus.")
 
 
 class TestPreflightErrors(unittest.TestCase):
