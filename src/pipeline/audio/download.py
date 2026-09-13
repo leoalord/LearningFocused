@@ -77,7 +77,8 @@ def download_podcasts(
     output_dir: str,
     metadata_dir: str = "metadata_output",
     limit: int | None = None,
-) -> None:
+    transcripts_dir: str | None = None,
+) -> dict[str, int]:
     """
     Download podcasts from an RSS feed.
 
@@ -86,6 +87,9 @@ def download_podcasts(
         output_dir: The directory to save downloaded episodes.
         metadata_dir: The directory to save episode metadata.
         limit: The maximum number of episodes to download. If None, downloads all.
+        transcripts_dir: If set, skip the MP3 when a matching transcript already
+            exists. Cloud Run jobs hydrate transcripts without the 6GB audio
+            dump; this avoids re-downloading every episode.
     """
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
@@ -137,6 +141,12 @@ def download_podcasts(
                 skipped_existing += 1
                 continue
 
+            if transcripts_dir:
+                transcript_path = os.path.join(transcripts_dir, f"{clean_title}.json")
+                if os.path.exists(transcript_path):
+                    skipped_existing += 1
+                    continue
+
             audio_url = None
             if hasattr(entry, "links"):
                 for link in entry.links:
@@ -175,13 +185,18 @@ def download_podcasts(
         "Download process completed. "
         f"new={downloaded} skipped_existing={skipped_existing} failed={failed}"
     )
+    return {"new": downloaded, "skipped_existing": skipped_existing, "failed": failed}
 
 
 def main() -> None:
-    from src.config import RSS_FEED_URL, DOWNLOADS_DIR, METADATA_DIR
+    from src.config import RSS_FEED_URL, DOWNLOADS_DIR, METADATA_DIR, TRANSCRIPTS_DIR
 
     download_podcasts(
-        RSS_FEED_URL, str(DOWNLOADS_DIR), metadata_dir=str(METADATA_DIR), limit=15
+        RSS_FEED_URL,
+        str(DOWNLOADS_DIR),
+        metadata_dir=str(METADATA_DIR),
+        limit=15,
+        transcripts_dir=str(TRANSCRIPTS_DIR),
     )
 
 

@@ -103,6 +103,7 @@ def _download(download_limit: int) -> None:
         str(DOWNLOADS_DIR),
         metadata_dir=str(METADATA_DIR),
         limit=download_limit,
+        transcripts_dir=str(TRANSCRIPTS_DIR),
     )
 
 
