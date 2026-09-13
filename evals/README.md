@@ -45,13 +45,13 @@ Do not treat `source_hint` as a required metadata match for the official hit. Me
 
 ## Eval runner (TASK-11)
 
-Requires an existing on-disk Chroma store (`chroma_db/`) and embedding credentials in `.env`. Each question issues billed `text-embedding-3-small` queries. The runner **does not** `--reset-chroma`, does not add documents, and does not run ingest pipelines. It opens the collection read-only (`create_collection_if_not_exists=False`) and does not create pipeline data directories.
+Requires an existing on-disk Chroma store (`chroma_db/`) and embedding credentials in `.env`. Each question issues billed `text-embedding-3-small` queries. The runner **does not** `--reset-chroma`, does not add documents, and does not run ingest pipelines. It opens the collection read-only (`create_collection_if_not_exists=False`) and does not create pipeline data directories. After FastMCP, it still runs **in-process** against `src.mcp_server.retrieval.retrieve_documents` (the helper `search`/`fetch` wrap). It does not start an HTTP MCP server.
 
 ```bash
 uv run python -m evals.run
 ```
 
-Optional flags: `--gold`, `--report`, `--max-segments` (default 5), `--max-summaries` (default 3). Defaults match `search_knowledge_base` (`query_summaries` then `query_segments`).
+Optional flags: `--gold`, `--report`, `--max-segments` (default 5), `--max-summaries` (default 3). Defaults match `search` / `search_knowledge_base` (`query_summaries` then `query_segments`).
 
 Stdout prints `N`, hit rate, missed ids, miss split, and each failed question (not only a percentage). JSON is written to `evals/last_report.json`.
 

@@ -116,6 +116,16 @@ uv run python -m src.react_agent.chat_cli
 
 See deeper docs: `src/react_agent/README.md`.
 
+### Public MCP (Streamable HTTP)
+
+Same FastMCP 4 binary locally and on Cloud Run. Tools are `search` and `fetch`. See `docs/mcp_server.md`.
+
+```bash
+uv run python -m src.mcp_server
+```
+
+Cursor config is a URL: `http://127.0.0.1:8000/mcp`. Evals stay in-process: `uv run python -m evals.run`.
+
 ### Local chat UI (answer + source cards)
 
 Browser demo: ask a question, see the answer plus citation cards (`SourceChunk` title + episode or URL). Keys stay in `.env` on the server.
@@ -177,6 +187,7 @@ uv run python -m src.analysis.investigate_entity "MacKenzie Price"
 - **`src/deep_research_agent/`**: LangGraph deep research CLI agent
 - **`src/react_agent/`**: lightweight ReAct-style CLI agent
 - **`src/ui/`**: local FastAPI chat UI (source cards)
+- **`src/mcp_server/`**: public FastMCP 4 Streamable HTTP server (`search` + `fetch`)
 
 ## Notes
 

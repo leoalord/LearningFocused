@@ -2,7 +2,11 @@
   "generated_at": "2026-01-01T00:00:00+00:00",
   "command": "uv run python -m evals.run",
   "retriever": {
-    "helpers": ["query_summaries", "query_segments"],
+    "helpers": [
+      "src.mcp_server.retrieval.retrieve_documents",
+      "query_summaries",
+      "query_segments"
+    ],
     "max_segments": 5,
     "max_summaries": 3,
     "hit_definition": "casefold; every must_include substring in concatenated retrieved page_content; source_hint not used for scoring"

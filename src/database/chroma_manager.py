@@ -80,6 +80,7 @@ def query_segments(
 def query_summaries(
     query: str,
     k: int = 5,
+    filter_metadata: Optional[Dict[str, Any]] = None,
     *,
     allowed_types: Optional[List[str]] = None,
     vector_store: Optional[Chroma] = None,
@@ -96,11 +97,21 @@ def query_summaries(
 
     # Prefer server-side $in filtering, but fall back to client-side if unsupported.
     filter_dict: Dict[str, Any] = {"type": {"$in": types}}
+    if filter_metadata:
+        filter_dict.update(filter_metadata)
+
     try:
         return vector_store.similarity_search(query, k=k, filter=cast(Any, filter_dict))
     except Exception:
         docs = vector_store.similarity_search(query, k=k * 3)
         filtered = [d for d in docs if d.metadata.get("type") in types]
+        if filter_metadata:
+            def _match_meta(d: Document) -> bool:
+                for mk, mv in filter_metadata.items():
+                    if d.metadata.get(mk) != mv:
+                        return False
+                return True
+            filtered = [d for d in filtered if _match_meta(d)]
         return filtered[:k]
 
 def update_chroma_db(

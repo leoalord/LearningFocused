@@ -16,7 +16,12 @@ TRANSCRIPTS_DIR = PROJECT_ROOT / "transcripts"
 SEGMENTED_DIR = PROJECT_ROOT / "segmented_transcripts"
 METADATA_DIR = PROJECT_ROOT / "metadata_output"
 COMBINED_DIR = PROJECT_ROOT / "combined_summaries"
-CHROMA_DIR = PROJECT_ROOT / "chroma_db"
+# Local PersistentClient path. Cloud Run hydrates the GCS snapshot here (or
+# to CHROMA_DIR if that env var is set). Not Chroma Cloud.
+_chroma_override = os.getenv("CHROMA_DIR")
+CHROMA_DIR = (
+    Path(_chroma_override).expanduser() if _chroma_override else PROJECT_ROOT / "chroma_db"
+)
 
 # Substack/article artifact directories (parallel to podcast artifacts)
 SUBSTACK_DIR = PROJECT_ROOT / "substack_articles"

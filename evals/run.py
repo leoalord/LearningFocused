@@ -5,7 +5,8 @@ Usage:
     uv run python -m evals.run --report evals/last_report.json
 
 Does not reset, add, or delete Chroma documents. Queries the same helpers
-the agent search tools use (query_segments + query_summaries).
+the FastMCP search/fetch tools wrap (query_segments + query_summaries)
+in-process — no HTTP MCP client.
 """
 
 from __future__ import annotations
@@ -34,7 +35,8 @@ from evals.scoring import (
     slice_name,
 )
 from src.config import CHROMA_DIR, PROJECT_ROOT
-from src.database.chroma_manager import COLLECTION_NAME, get_vector_store, query_segments, query_summaries
+from src.database.chroma_manager import COLLECTION_NAME
+from src.mcp_server.retrieval import retrieve_documents
 
 DEFAULT_GOLD = PROJECT_ROOT / "evals" / "gold_questions.json"
 DEFAULT_REPORT = PROJECT_ROOT / "evals" / "last_report.json"
@@ -141,25 +143,13 @@ def inspect_corpus(
     return status
 
 
-_EVAL_STORE = None
-
-
-def _read_only_store():
-    global _EVAL_STORE
-    if _EVAL_STORE is None:
-        _EVAL_STORE = get_vector_store(create_if_missing=False)
-    return _EVAL_STORE
-
-
 def retrieve(question: str, *, max_segments: int, max_summaries: int):
-    store = _read_only_store()
-    summaries = (
-        query_summaries(question, k=max_summaries, vector_store=store) if max_summaries > 0 else []
+    # Same retrieve_documents() the FastMCP search tool wraps (in-process).
+    return retrieve_documents(
+        question,
+        max_segments=max_segments,
+        max_summaries=max_summaries,
     )
-    segments = (
-        query_segments(query=question, k=max_segments, vector_store=store) if max_segments > 0 else []
-    )
-    return summaries, segments
 
 
 def evaluate(
@@ -286,7 +276,11 @@ def evaluate(
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "command": "uv run python -m evals.run",
         "retriever": {
-            "helpers": ["query_summaries", "query_segments"],
+            "helpers": [
+                "src.mcp_server.retrieval.retrieve_documents",
+                "query_summaries",
+                "query_segments",
+            ],
             "max_segments": max_segments,
             "max_summaries": max_summaries,
             "hit_definition": (
