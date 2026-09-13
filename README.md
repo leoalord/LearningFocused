@@ -10,6 +10,7 @@ Build a queryable knowledge base from a corpus of podcast audio + transcripts + 
 ## Stores (high level)
 
 - **Filesystem**: raw MP3s, transcripts, segmented topics, generated summaries
+- **GCS backup** (off-laptop; one private bucket): see `docs/gcs_backup.md`
 - **Chroma**: embeddings for transcript segments + summary-like docs + Substack text/summaries
 - **Neo4j**: graph extraction over Documents (good for “what’s connected to what?”)
 
