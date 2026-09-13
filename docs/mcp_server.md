@@ -97,6 +97,8 @@ Runtime SA `learningfocused-mcp@inferpoker.iam.gserviceaccount.com` has `roles/s
 
 Hydrate is `python -m src.mcp_server.hydrate` in `scripts/mcp_entrypoint.sh`. It copies the snapshot; it does not `--reset-chroma`.
 
+The daily ingest **job** (`learningfocused-ingest`) is a separate Cloud Run Job. After it updates `chroma_db/` in GCS it rolls this service (`CHROMA_SNAPSHOT_AT`) so warm instances rehydrate. It does not scale MCP to zero. See `docs/daily_ingest.md`.
+
 Smoke the public endpoint (Streamable HTTP initialize):
 
 ```bash

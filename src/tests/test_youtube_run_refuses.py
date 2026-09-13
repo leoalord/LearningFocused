@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 from src.pipeline.youtube.run import build_parser, main
 
@@ -43,8 +46,6 @@ class TestYoutubeRunRefuses(unittest.TestCase):
         self.assertEqual(code, 2)
 
     def test_refuses_empty_rss_without_override(self) -> None:
-        from unittest.mock import patch
-
         with patch("src.pipeline.youtube.run.load_rss_entries", return_value=[]), patch(
             "src.pipeline.youtube.run._episodes_playlist_ids", return_value=set()
         ):
@@ -57,6 +58,33 @@ class TestYoutubeRunRefuses(unittest.TestCase):
         self.assertFalse(args.prune_stale_chroma)
         args = parser.parse_args(["--prune-stale-chroma"])
         self.assertTrue(args.prune_stale_chroma)
+
+    def test_ingest_one_skips_complete_artifacts_without_ytdlp(self) -> None:
+        from src.pipeline.youtube.run import Candidate, ingest_one
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            transcripts = root / "t"
+            segmented = root / "s"
+            summaries = root / "u"
+            for d in (transcripts, segmented, summaries):
+                d.mkdir()
+            vid = "abcdefghijk"
+            (transcripts / f"{vid}.json").write_text("{}", encoding="utf-8")
+            (segmented / f"{vid}.json").write_text("{}", encoding="utf-8")
+            (summaries / f"{vid}.json").write_text("{}", encoding="utf-8")
+            cand = Candidate(video_id=vid, title="already ingested", bucket="unique_longform")
+            with (
+                patch("src.pipeline.youtube.run.YOUTUBE_SEGMENTED_DIR", segmented),
+                patch("src.pipeline.youtube.run.YOUTUBE_SUMMARIES_DIR", summaries),
+                patch("src.pipeline.youtube.run.transcript_exists", return_value=transcripts / f"{vid}.json"),
+                patch("src.pipeline.youtube.run._enrich_candidate") as enrich,
+                patch("src.pipeline.youtube.run.download_captions") as captions,
+            ):
+                out = ingest_one(cand, force=False)
+            self.assertEqual(out, vid)
+            enrich.assert_not_called()
+            captions.assert_not_called()
 
 
 if __name__ == "__main__":

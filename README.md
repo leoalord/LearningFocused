@@ -76,6 +76,15 @@ uv run python -m src.pipeline.substack.run -- --mode daily --ingest-limit 10
 
 See deeper docs: `src/pipeline/substack/README.md`.
 
+### Daily ingest (Cloud Run Job)
+
+One command / job walks Art19 + Substack + unique YouTube without aborting the whole run. See `docs/daily_ingest.md`.
+
+```bash
+uv run python -m src.pipeline.daily_ingest --dry-run --skip-hydrate --skip-sync --skip-roll
+./scripts/deploy_ingest_job.sh
+```
+
 ## Databases (populate/searchable stores)
 
 - **Chroma** (vectors; builds/updates from pipeline artifacts):
@@ -181,7 +190,7 @@ uv run python -m src.analysis.investigate_entity "MacKenzie Price"
 
 ## Project structure (high level)
 
-- **`src/pipeline/`**: ingestion and processing pipelines (audio + Substack)
+- **`src/pipeline/`**: ingestion and processing pipelines (audio + Substack + YouTube + daily ingest)
 - **`src/database/`**: thin DB adapters/orchestrators (Chroma + Neo4j)
 - **`src/analysis/`**: inspection/visualization tooling
 - **`src/deep_research_agent/`**: LangGraph deep research CLI agent

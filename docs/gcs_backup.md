@@ -29,6 +29,7 @@ Do **not** put corpus objects in `gs://inferpoker-tfstate`.
 | `youtube_videos/` | `youtube_videos/` | YouTube ingest text |
 | `youtube_summaries/` | `youtube_summaries/` | YouTube summaries |
 | `podcast_downloads/` | `podcast_downloads/` | Source audio (MP3) |
+| `ingest_ledger/` | `ingest_ledger/` | Daily ingest run ledger (TASK-19) |
 
 Not uploaded: `neo4j/`, `.env`, `.venv`, `.git`, `*.pem`, `metadata_output/` (optional; not required to recover transcripts/summaries/chroma).
 

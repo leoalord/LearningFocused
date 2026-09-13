@@ -19,7 +19,7 @@ from typing import Any, Sequence
 
 from dotenv import load_dotenv
 
-from src.config import YOUTUBE_DIR, YOUTUBE_METADATA_DIR, ensure_data_dirs
+from src.config import YOUTUBE_DIR, YOUTUBE_METADATA_DIR, YOUTUBE_SEGMENTED_DIR, YOUTUBE_SUMMARIES_DIR, ensure_data_dirs
 from src.pipeline.youtube.constants import (
     BUCKET_APPEARANCE,
     BUCKET_BRANDING,
@@ -323,6 +323,16 @@ def ingest_one(cand: Candidate, *, force: bool = False) -> str:
     """Download captions (or audio), transcribe, segment, summarize one unique video."""
     from src.pipeline.youtube.segment import segment_video
     from src.pipeline.youtube.summarize import summarize_video
+
+    existing_transcript = transcript_exists(cand.video_id)
+    segmented_path = YOUTUBE_SEGMENTED_DIR / f"{cand.video_id}.json"
+    summary_path = YOUTUBE_SUMMARIES_DIR / f"{cand.video_id}.json"
+    if not force and existing_transcript and segmented_path.is_file() and summary_path.is_file():
+        print(
+            f"Skip existing unique video {cand.video_id} "
+            "(transcript/segment/summary present; no yt-dlp, no re-transcribe)"
+        )
+        return cand.video_id
 
     cand = _enrich_candidate(cand)
     persist_sidecar(cand, status="ingest")

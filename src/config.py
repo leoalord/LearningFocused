@@ -23,6 +23,9 @@ CHROMA_DIR = (
     Path(_chroma_override).expanduser() if _chroma_override else PROJECT_ROOT / "chroma_db"
 )
 
+# Daily ingest run ledger (TASK-19). Also mirrored to gs://.../ingest_ledger/.
+LEDGER_DIR = PROJECT_ROOT / "ingest_ledger"
+
 # Substack/article artifact directories (parallel to podcast artifacts)
 SUBSTACK_DIR = PROJECT_ROOT / "substack_articles"
 SUBSTACK_METADATA_DIR = SUBSTACK_DIR / "metadata"
@@ -55,6 +58,7 @@ DATA_DIRS = [
     YOUTUBE_TRANSCRIPTS_DIR,
     YOUTUBE_SEGMENTED_DIR,
     YOUTUBE_SUMMARIES_DIR,
+    LEDGER_DIR,
 ]
 
 
