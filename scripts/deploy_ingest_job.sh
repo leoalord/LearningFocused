@@ -90,8 +90,21 @@ gcloud artifacts repositories add-iam-policy-binding "${AR_REPO_SOURCE}" \
   --location="${REGION}" \
   --member="serviceAccount:${SA_EMAIL}" \
   --role="roles/artifactregistry.reader" \
+  --project="${PROJECT}"
+
+echo ">> Verifying Artifact Registry IAM on ${AR_REPO_SOURCE} (must include ingest SA reader)"
+gcloud artifacts repositories get-iam-policy "${AR_REPO_SOURCE}" \
+  --location="${REGION}" \
+  --project="${PROJECT}"
+if ! gcloud artifacts repositories get-iam-policy "${AR_REPO_SOURCE}" \
+  --location="${REGION}" \
   --project="${PROJECT}" \
-  >/dev/null
+  --flatten='bindings[].members' \
+  --filter="bindings.role=roles/artifactregistry.reader AND bindings.members:serviceAccount:${SA_EMAIL}" \
+  --format='value(bindings.members)' | grep -q "serviceAccount:${SA_EMAIL}"; then
+  echo "Failed: ${SA_EMAIL} is not artifactregistry.reader on ${AR_REPO_SOURCE}" >&2
+  exit 1
+fi
 
 echo ">> Granting ${SA_EMAIL} actAs on MCP runtime SA ${MCP_SA}"
 gcloud iam service-accounts add-iam-policy-binding "${MCP_SA}" \

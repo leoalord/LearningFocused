@@ -85,7 +85,13 @@ The scheduler only *starts* the job (deadline 180s). The job itself may run for 
 
 After a successful GCS sync the job PATCHes `learningfocused-mcp` with `CHROMA_SNAPSHOT_AT=<run_id>`. That creates a **new revision** of the existing image (no image rebuild, no `--min-instances=0`). New instances hydrate `gs://…/chroma_db/` onto `/data/chroma_db`. Old warm instances drain. Public `/mcp` stays unauthenticated.
 
-The ingest SA also needs `roles/artifactregistry.reader` on `cloud-run-source-deploy` so Cloud Run can pull the current MCP image when minting that revision. `./scripts/deploy_ingest_job.sh` grants it.
+The ingest SA also needs `roles/artifactregistry.reader` on `cloud-run-source-deploy` so Cloud Run can pull the current MCP image when minting that revision. The repo IAM was empty until that binding was applied live; `./scripts/deploy_ingest_job.sh` grants it and fails if the member is missing.
+
+Confirm:
+
+```bash
+gcloud artifacts repositories get-iam-policy cloud-run-source-deploy --location=us-west1 --project=inferpoker
+```
 
 ## “New RSS episode without a laptop”
 
@@ -94,9 +100,9 @@ The job cannot wait for S E357. Structural proof:
 1. Art19 `download.py` skips existing transcripts and only downloads titles that are not already transcribed.
 2. Cloud Run Job executions walk all three sources with skip-existing (no `--force`, no `--reset-chroma`, no 6 GiB audio pull). Scheduler run `learningfocused-ingest-75gz8` was created at 08:00 America/Los_Angeles by `learningfocused-ingest@` (not a laptop `gcloud`).
 3. Scheduler `learningfocused-ingest-daily` is ENABLED, `0 8 * * *` America/Los_Angeles, targeting the job `:run` API.
-4. Ledger + GCS prefixes are on the success path. MCP roll from the job SA currently 403s without Artifact Registry reader; a matching env-var roll (`CHROMA_SNAPSHOT_AT`) produced revision `learningfocused-mcp-00002-g9x` with `minScale=1`.
+4. After Artifact Registry reader was applied on `cloud-run-source-deploy`, job execution `learningfocused-ingest-ctwxh` (runtime SA `learningfocused-ingest@`) wrote `mcp_roll.ok: true` and minted revision `learningfocused-mcp-00004-lhp` with `serving.knative.dev/creator: learningfocused-ingest@inferpoker.iam.gserviceaccount.com` and `minScale=1`. Public `/health` 200 and unauthenticated `/mcp` still work.
 
-When E357 (or any new Art19 item) appears in the RSS feed, the next 08:00 Pacific run downloads that one MP3, transcribes it, upserts Chroma, uploads the snapshot, and rolls MCP — no laptop session required (after the Artifact Registry reader grant).
+When E357 (or any new Art19 item) appears in the RSS feed, the next 08:00 Pacific run downloads that one MP3, transcribes it, upserts Chroma, uploads the snapshot, and rolls MCP — no laptop session required.
 
 ## Local
 
