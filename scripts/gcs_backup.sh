@@ -3,8 +3,8 @@
 # Independent of MCP serve. Does not touch neo4j/, .env, .venv, .git, or *.pem.
 set -euo pipefail
 
-PROJECT="${GCP_BACKUP_PROJECT:-inferpoker}"
-BUCKET="${GCS_CORPUS_BUCKET:-inferpoker-learningfocused}"
+PROJECT="${GCP_BACKUP_PROJECT:-gen-lang-client-0304733057}"
+BUCKET="${GCS_CORPUS_BUCKET:-learningfocused-corpus}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EXCLUDE='(^|/)\.DS_Store$'
 # Keep objects non-composite so restore is not gcloud-crc32c-only.

@@ -6,15 +6,23 @@ The gitignored corpus lives in **one private GCS bucket**. This is an off-laptop
 
 | | |
 |---|---|
-| Bucket | `gs://inferpoker-learningfocused` |
-| Project | `inferpoker` (project number `920577997010`) |
-| Location | `us-west1` (same region as `gs://inferpoker-tfstate`) |
+| Bucket | `gs://learningfocused-corpus` |
+| Project | LearningFocus (`gen-lang-client-0304733057`) |
+| Location | `us-west1` |
 | Access | Uniform bucket-level access, public access prevention **enforced**, no public objects |
 | Storage class | Standard |
 
-`.env` may list `GCP_PROJECT_ID=gen-lang-client-0304733057` (Generative Language / AI Studio). Corpus backup is **not** that project. Use `inferpoker`, which is the gcloud active project with billing on and existing `us-west1` buckets.
+Everything for LearningFocused lives in the LearningFocus project (`gen-lang-client-0304733057`, the same project as `.env` `GCP_PROJECT_ID`). Do **not** put LearningFocused resources in `inferpoker`; that project belongs to InferPoker. The corpus was first created in `gs://inferpoker-learningfocused`; `./scripts/migrate_to_learningfocus.sh` copies it here.
 
-Do **not** put corpus objects in `gs://inferpoker-tfstate`.
+## Moving from inferpoker (one time)
+
+```bash
+./scripts/migrate_to_learningfocus.sh   # creates gs://learningfocused-corpus, copies every object from gs://inferpoker-learningfocused
+./scripts/deploy_mcp.sh                 # new MCP service in LearningFocus
+./scripts/deploy_ingest_job.sh          # new daily job + scheduler in LearningFocus
+```
+
+The script only copies; it never deletes anything in `inferpoker`. It prints the cleanup commands to run once the new setup is verified.
 
 ## Prefixes (local dir name = object prefix)
 
@@ -53,8 +61,8 @@ caffeinate -dims &
 Equivalent raw commands:
 
 ```bash
-PROJECT=inferpoker
-BUCKET=inferpoker-learningfocused
+PROJECT=gen-lang-client-0304733057
+BUCKET=learningfocused-corpus
 EXCLUDE='(^|/)\.DS_Store$'
 
 gcloud storage rsync ./chroma_db gs://${BUCKET}/chroma_db \
@@ -66,7 +74,7 @@ gcloud storage rsync ./chroma_db gs://${BUCKET}/chroma_db \
 
 ## Restore without this laptop
 
-On a new machine with `gcloud` authenticated to `inferpoker`:
+On a new machine with `gcloud` authenticated to LearningFocus (`gen-lang-client-0304733057`):
 
 ```bash
 git clone git@github.com:leoalord/LearningFocused.git
@@ -80,8 +88,8 @@ uv sync
 ./scripts/gcs_backup.sh restore-artifacts
 
 # Optional: restore audio
-gcloud storage rsync gs://inferpoker-learningfocused/podcast_downloads ./podcast_downloads \
-  --recursive --checksums-only --exclude='(^|/)\.DS_Store$' --project=inferpoker
+gcloud storage rsync gs://learningfocused-corpus/podcast_downloads ./podcast_downloads \
+  --recursive --checksums-only --exclude='(^|/)\.DS_Store$' --project=gen-lang-client-0304733057
 ```
 
 After `restore-chroma`, local code can open `chroma_db/` with the existing `PersistentClient` / `get_vector_store()` path. No Chroma Cloud. No Hugging Face.
@@ -92,8 +100,8 @@ After `restore-chroma`, local code can open `chroma_db/` with the existing `Pers
 
 ```bash
 # object count (strip `ls` prefix headers that end in ':')
-gcloud storage ls --recursive --project=inferpoker gs://inferpoker-learningfocused/chroma_db | grep -v ':$' | wc -l
-gcloud storage du --summarize --readable-sizes gs://inferpoker-learningfocused
+gcloud storage ls --recursive --project=gen-lang-client-0304733057 gs://learningfocused-corpus/chroma_db | grep -v ':$' | wc -l
+gcloud storage du --summarize --readable-sizes gs://learningfocused-corpus
 ```
 
 Uploads set `CLOUDSDK_STORAGE_PARALLEL_COMPOSITE_UPLOAD_ENABLED=False` so `chroma.sqlite3` is a normal object (MD5), not a composite.
