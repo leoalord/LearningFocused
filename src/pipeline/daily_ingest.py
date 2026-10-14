@@ -506,6 +506,16 @@ def run(
                 "ok": True,
                 **roll_mcp_service(snapshot_at=run_id),
             }
+            if ledger["mcp_roll"].get("skipped"):
+                # A Postgres-backed MCP only sees today's content through the Chroma ->
+                # Postgres copy, so without it the service is silently stale.
+                copied = use_pg and bool((ledger["pg_state"].get("chroma_to_pg") or {}).get("ok"))
+                if not copied:
+                    reason = ("MCP reads Postgres but this job has no PG_DSN" if not use_pg
+                              else "MCP reads Postgres but the Chroma -> Postgres copy failed")
+                    ledger["mcp_roll"].update(ok=False, reason=reason)
+                    ledger["errors"].append(f"mcp_roll: {reason}")
+                    print(f"MCP not updated: {reason}")
         except Exception as exc:  # noqa: BLE001
             ledger["mcp_roll"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
             ledger["errors"].append(f"mcp_roll: {exc}")

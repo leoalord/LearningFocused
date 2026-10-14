@@ -65,16 +65,20 @@ def retrieve_documents(
     max_summaries: int = DEFAULT_MAX_SUMMARIES,
     filter_metadata: Optional[dict] = None,
     mode: Optional[str] = None,
+    kb_backend: Optional[str] = None,
 ) -> Tuple[List[Document], List[Document]]:
     """Bounded retrieval used by MCP tools and evals (full page_content).
 
     `mode` (vector / keyword / hybrid) applies to the postgres backend; Chroma is vector only.
     `filter_metadata` applies to the chroma backend; postgres fetches by id in `fetch`.
+    `kb_backend` overrides KB_BACKEND for this call (evals compare backends with it).
     """
     q = bound_query(query)
     k_seg = clamp_k(max_segments, cap=max_segments_cap(), default=DEFAULT_MAX_SEGMENTS)
     k_sum = clamp_k(max_summaries, cap=max_summaries_cap(), default=DEFAULT_MAX_SUMMARIES)
-    if backend() == "postgres":
+    if kb_backend is not None and kb_backend not in BACKENDS:
+        raise ValueError(f"kb_backend must be one of {BACKENDS}, got {kb_backend!r}")
+    if (kb_backend or backend()) == "postgres":
         if filter_metadata:
             raise ValueError("filter_metadata is a chroma-backend option; use fetch for ids")
         from src.database import pg_search

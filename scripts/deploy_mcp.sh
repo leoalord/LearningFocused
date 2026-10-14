@@ -5,9 +5,11 @@
 #
 # KB_BACKEND picks the store the server reads:
 #   chroma (default)  hydrate the Chroma snapshot from GCS at boot; min 1 instance, 2Gi.
-#   postgres          read the Postgres VM live over Direct VPC egress (PG_DSN from the
-#                     learningfocused-pg-dsn secret, made by deploy_postgres_vm.sh); adds the
-#                     keyword/vector/hybrid/graph tools; no hydrate, so it can scale to zero.
+#   postgres          read the Postgres VM live over Direct VPC egress as the read-only
+#                     learningfocused_mcp role (PG_DSN from the learningfocused-pg-dsn-reader
+#                     secret, made by deploy_postgres_vm.sh); adds the keyword/vector/hybrid/
+#                     graph tools; no hydrate, so it scales to zero (first request after idle
+#                     pays a cold start of a few seconds).
 # Roll back to Chroma at any time with KB_BACKEND=chroma ./scripts/deploy_mcp.sh.
 set -euo pipefail
 
@@ -26,7 +28,8 @@ ENV_FILE="${ROOT}/.env"
 UPDATE_SECRETS="${UPDATE_SECRETS:-0}"
 KB_BACKEND="${KB_BACKEND:-chroma}"
 KB_SEARCH_MODE="${KB_SEARCH_MODE:-vector}"
-SECRET_DSN="${SECRET_PG_DSN:-learningfocused-pg-dsn}"
+SECRET_DSN="${SECRET_PG_READER_DSN:-learningfocused-pg-dsn-reader}"
+INGEST_JOB="${CLOUD_RUN_JOB:-learningfocused-ingest}"
 NETWORK="${PG_NETWORK:-default}"
 SUBNET="${PG_SUBNET:-default}"
 
@@ -34,10 +37,14 @@ case "${KB_BACKEND}" in
   chroma)
     MIN_INSTANCES="${MCP_MIN_INSTANCES:-1}"
     MEMORY="${MCP_MEMORY:-2Gi}"
+    CONCURRENCY="${MCP_CONCURRENCY:-80}"
     ;;
   postgres)
     MIN_INSTANCES="${MCP_MIN_INSTANCES:-0}"
     MEMORY="${MCP_MEMORY:-1Gi}"
+    # Each instance holds at most PG_MAX_CONNECTIONS (4) connections; keep requests per
+    # instance near that so they queue at Cloud Run, not inside the server.
+    CONCURRENCY="${MCP_CONCURRENCY:-8}"
     ;;
   *)
     echo "KB_BACKEND must be chroma or postgres (got ${KB_BACKEND})" >&2
@@ -48,6 +55,10 @@ case "${KB_SEARCH_MODE}" in
   vector|keyword|hybrid) ;;
   *) echo "KB_SEARCH_MODE must be vector, keyword or hybrid (got ${KB_SEARCH_MODE})" >&2; exit 2 ;;
 esac
+if ! [[ "${MIN_INSTANCES}" =~ ^[0-9]+$ && "${CONCURRENCY}" =~ ^[0-9]+$ ]]; then
+  echo "MCP_MIN_INSTANCES and MCP_CONCURRENCY must be whole numbers." >&2
+  exit 2
+fi
 if [[ "${KB_BACKEND}" == "chroma" && "${MIN_INSTANCES}" -lt 1 ]]; then
   echo "The chroma backend hydrates at boot and the daily roll refuses min-instances 0; use MCP_MIN_INSTANCES>=1." >&2
   exit 2
@@ -133,6 +144,12 @@ if [[ "${KB_BACKEND}" == "postgres" ]]; then
     exit 1
   fi
   RUNTIME_SECRETS+=("${SECRET_DSN}")
+  # The service only sees new content through the daily job's Chroma -> Postgres copy.
+  if ! gcloud run jobs describe "${INGEST_JOB}" --region="${REGION}" --project="${PROJECT}" \
+      --format=json 2>/dev/null | grep -q '"PG_DSN"'; then
+    echo "WARNING: ${INGEST_JOB} has no PG_DSN, so Postgres won't get new content." >&2
+    echo "         Re-run ./scripts/deploy_ingest_job.sh (it wires Postgres once the DSN secret exists)." >&2
+  fi
 fi
 
 for secret in "${RUNTIME_SECRETS[@]}"; do
@@ -152,7 +169,7 @@ SECRETS="OPENAI_API_KEY=${SECRET_OPENAI}:latest,GOOGLE_API_KEY=${SECRET_GOOGLE}:
 if [[ "${KB_BACKEND}" == "postgres" ]]; then
   # Private IPs only go through the VPC (the Postgres VM has no external IP); the
   # OpenAI embedding calls still leave directly. Its firewall allows this subnet.
-  ENV_VARS+=",HYDRATE_CHROMA=0"
+  ENV_VARS+=",HYDRATE_CHROMA=0,PG_MAX_CONNECTIONS=4"
   SECRETS+=",PG_DSN=${SECRET_DSN}:latest"
   BACKEND_FLAGS=(--network="${NETWORK}" --subnet="${SUBNET}" --vpc-egress=private-ranges-only --cpu-throttling)
 else
@@ -170,6 +187,7 @@ gcloud run deploy "${SERVICE}" \
   --service-account="${SA_EMAIL}" \
   --allow-unauthenticated \
   --min-instances="${MIN_INSTANCES}" \
+  --concurrency="${CONCURRENCY}" \
   --max-instances=3 \
   --memory="${MEMORY}" \
   --cpu=1 \

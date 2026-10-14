@@ -48,7 +48,7 @@ The tools depend on `KB_BACKEND` (set by `./scripts/deploy_mcp.sh`):
 | `hybrid_search` | not offered | keyword + vector fused with Reciprocal Rank Fusion (k=60) |
 | `graph_query` | not offered | Fixed templates over the AGE graph: `schema`, `find_entities`, `neighbors`, `connections` (1-3 hops), `mentions` |
 
-`graph_query` never takes query text: the caller picks a template and passes values (entity names, a label checked against the graph's own labels, hop count), which travel as bound parameters. Every Postgres connection is read-only (`default_transaction_read_only`) with a statement timeout (`PG_STATEMENT_TIMEOUT_MS`, default 5000), and the DSN uses the non-superuser app role. On the chroma backend, graph / Cypher stay off this surface (`query_knowledge_graph` remains a local LangChain `@tool` for CLIs only).
+`graph_query` never takes query text: the caller picks a template and passes values (entity names, a label checked against the graph's own labels, hop count), which travel as bound parameters. `connections` returns shortest paths first and doesn't route through source passages (`MENTIONS`). Every Postgres connection is read-only (`default_transaction_read_only`, and a role that can only SELECT) with a statement timeout (`PG_STATEMENT_TIMEOUT_MS`, default 5000). On the chroma backend, graph / Cypher stay off this surface (`query_knowledge_graph` remains a local LangChain `@tool` for CLIs only).
 
 Caps (TASK-18), env-overridable:
 
@@ -139,4 +139,10 @@ KB_BACKEND=postgres ./scripts/deploy_mcp.sh                       # search stays
 KB_BACKEND=postgres KB_SEARCH_MODE=hybrid ./scripts/deploy_mcp.sh # if hybrid scored better
 ```
 
-On `postgres` the service skips the Chroma hydrate, reads `PG_DSN` from the `learningfocused-pg-dsn` secret, reaches the VM over Direct VPC egress (private ranges only), and defaults to 0 minimum instances with 1Gi and CPU throttling, which removes most of the always-on Cloud Run cost (override with `MCP_MIN_INSTANCES` / `MCP_MEMORY`). The daily job sees `KB_BACKEND=postgres` on the service and stops rolling it, since new chunks are visible as soon as they're synced. `KB_BACKEND=chroma ./scripts/deploy_mcp.sh` switches back.
+On `postgres` the service:
+
+- skips the Chroma hydrate and connects as the read-only `learningfocused_mcp` role (`PG_DSN` from the `learningfocused-pg-dsn-reader` secret; SELECT only, read-only transactions, at most 15 connections), over Direct VPC egress (private ranges only);
+- opens at most 4 connections per instance (`PG_MAX_CONNECTIONS`) and takes 8 requests per instance (`MCP_CONCURRENCY`), with 5s connect and statement timeouts; database errors reach clients as a short "busy / unavailable" message, never with hosts or roles;
+- defaults to 0 minimum instances with 1Gi and CPU throttling, which removes most of the always-on Cloud Run cost (override with `MCP_MIN_INSTANCES` / `MCP_MEMORY`). The trade-off is a cold start of a few seconds on the first request after it has been idle.
+
+The daily job sees `KB_BACKEND=postgres` on the service and stops rolling it, since new chunks are visible as soon as they're synced; the run is marked failed if the job has no `PG_DSN` or the Chroma → Postgres copy failed, so a stale service doesn't go unnoticed. `deploy_mcp.sh` also warns when the job isn't wired to Postgres. `KB_BACKEND=chroma ./scripts/deploy_mcp.sh` switches back.

@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -70,9 +69,20 @@ def _connect_collection():
         _fail(f"Could not open Chroma collection {COLLECTION_NAME!r}: {exc}")
 
 
+class _PostgresProbe:
+    """Answers `_first_where` from Postgres chunk metadata, like a Chroma collection.get."""
+
+    def get(self, *, where: dict[str, Any], limit: int, include: list[str]) -> dict[str, Any]:
+        from src.database.pg_search import read_only
+
+        del include
+        with read_only() as conn:
+            rows = conn.execute("SELECT id FROM chunks WHERE metadata @> %s::jsonb LIMIT %s",
+                                (json.dumps(where), limit)).fetchall()
+        return {"ids": [r[0] for r in rows]}
+
+
 def _first_where(collection, where: dict[str, Any]) -> bool:
-    if collection is None:  # postgres eval without a local Chroma: no "indexed" probe
-        return False
     try:
         res = collection.get(where=where, limit=1, include=["metadatas"])
     except Exception as exc:
@@ -147,13 +157,15 @@ def inspect_corpus(
     return status
 
 
-def retrieve(question: str, *, max_segments: int, max_summaries: int, mode: str | None = None):
+def retrieve(question: str, *, max_segments: int, max_summaries: int, backend: str = "chroma",
+             mode: str | None = None):
     # Same retrieve_documents() the FastMCP search tools wrap (in-process).
     return retrieve_documents(
         question,
         max_segments=max_segments,
         max_summaries=max_summaries,
         mode=mode,
+        kb_backend=backend,
     )
 
 
@@ -165,15 +177,13 @@ def evaluate(
     backend: str = "chroma",
     mode: str | None = None,
 ) -> dict[str, Any]:
-    # The backend is read by retrieve_documents from KB_BACKEND.
-    os.environ["KB_BACKEND"] = backend
     if backend == "chroma":
         _assert_chroma_readable()
         collection = _connect_collection()
     else:
-        # Chroma only feeds the miss analysis ("indexed") here; it's optional.
-        sqlite = CHROMA_DIR / "chroma.sqlite3"
-        collection = _connect_collection() if sqlite.exists() else None
+        # Miss analysis ("indexed") checks the same store the questions ran against.
+        collection = _PostgresProbe()
+        mode = mode or "vector"  # explicit, so KB_SEARCH_MODE in the shell can't change it
 
     per_question: list[dict[str, Any]] = []
     hits = 0
@@ -187,6 +197,7 @@ def evaluate(
                 q.question,
                 max_segments=max_segments,
                 max_summaries=max_summaries,
+                backend=backend,
                 mode=mode,
             )
         except Exception as exc:
@@ -289,10 +300,12 @@ def evaluate(
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "command": "uv run python -m evals.run",
+        "command": "uv run python -m evals.run"
+        + (f" --backend {backend}" if backend != "chroma" else "")
+        + (f" --mode {mode}" if mode else ""),
         "retriever": {
             "backend": backend,
-            "mode": mode or ("vector" if backend == "chroma" else os.getenv("KB_SEARCH_MODE") or "vector"),
+            "mode": mode or "vector",
             "helpers": [
                 "src.mcp_server.retrieval.retrieve_documents",
                 "query_summaries",

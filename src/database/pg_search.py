@@ -17,6 +17,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Iterator, Sequence
@@ -34,6 +36,11 @@ RRF_K = 60
 # How many candidates each list contributes to hybrid fusion, per result wanted.
 HYBRID_CANDIDATES_PER_RESULT = 4
 MAX_GRAPH_HOPS = 3
+# Relationships that link source passages to entities. Paths through them connect
+# almost everything to everything, so `connections` leaves them out.
+_PASSAGE_RELATIONSHIPS = ("MENTIONS",)
+SCHEMA_CACHE_SECONDS = 300
+NAME_KEY = "name_lc"  # lower-cased entity name written by neo4j_to_age
 EMBEDDING_MODEL = "text-embedding-3-small"
 _AGTYPE_SUFFIX = re.compile(r"(?<=[}\]])::(?:vertex|edge|path)")
 _LABEL_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
@@ -46,18 +53,46 @@ def statement_timeout_ms() -> int:
         return 5000
 
 
+class StoreBusy(RuntimeError):
+    """Every connection slot of this process is in use."""
+
+
+def _max_connections() -> int:
+    try:
+        return max(1, int(os.getenv("PG_MAX_CONNECTIONS") or 4))
+    except ValueError:
+        return 4
+
+
+# Caps this process's open connections, so a burst of public requests (Cloud Run runs
+# many at once per instance) can't exhaust the server's max_connections.
+_SLOTS = threading.BoundedSemaphore(_max_connections())
+SLOT_WAIT_SECONDS = 10
+
+
 @contextmanager
 def read_only(dsn: str | None = None) -> Iterator["psycopg.Connection"]:
-    """A read-only connection with a statement timeout; rolled back and closed after use."""
-    # Startup options, so they hold for every transaction on this connection.
-    conn = pg_store.connect(
-        dsn, extra_options=f"-c statement_timeout={statement_timeout_ms()} -c default_transaction_read_only=on"
-    )
+    """A read-only connection with a statement timeout; rolled back and closed after use.
+
+    The production DSN also names a role that can only read (`migrate --reader-role`);
+    the session settings make that hold for any role.
+    """
+    if not _SLOTS.acquire(timeout=SLOT_WAIT_SECONDS):
+        raise StoreBusy("all Postgres connections of this server are busy")
     try:
-        yield conn
+        # Startup options, so they hold for every transaction on this connection.
+        conn = pg_store.connect(
+            dsn, extra_options=f"-c statement_timeout={statement_timeout_ms()} -c default_transaction_read_only=on"
+        )
+        try:
+            yield conn
+        finally:
+            try:
+                conn.rollback()
+            finally:
+                conn.close()
     finally:
-        conn.rollback()
-        conn.close()
+        _SLOTS.release()
 
 
 _EMBEDDINGS: Any = None
@@ -199,21 +234,22 @@ def fetch_documents(
 ) -> tuple[list["Document"], list["Document"]]:
     """Chunks of one source: a documents.doc_id, a Substack/YouTube doc_id, or a podcast episode_id.
 
-    Segments come back in transcript order (start_time), not by similarity.
+    Segments come back grouped by document, then in transcript order (start_time), so two
+    recordings that share an episode number don't interleave.
     """
     ids = list(dict.fromkeys([source_id, source_id.replace(" ", "")]))
-    sql = """
-        SELECT c.id, c.type, c.content, c.metadata, 0.0
-        FROM chunks c
-        WHERE c.type = ANY(%s)
-          AND (c.doc_id = ANY(%s) OR c.metadata->>'doc_id' = ANY(%s) OR c.metadata->>'episode_id' = ANY(%s))
-        ORDER BY CASE WHEN c.metadata->>'start_time' ~ '^[0-9]+(\\.[0-9]+)?$'
-                      THEN (c.metadata->>'start_time')::float8 END NULLS LAST, c.id
-        LIMIT %s
-    """
+    # `metadata @> {...}` terms can use the jsonb_path_ops GIN index; `->>` can't.
+    contains = [json.dumps({key: i}) for i in ids for key in ("doc_id", "episode_id")]
+    sql = (
+        "SELECT c.id, c.type, c.content, c.metadata, 0.0 FROM chunks c "
+        "WHERE c.type = ANY(%s) AND (c.doc_id = ANY(%s) OR "
+        + " OR ".join(["c.metadata @> %s::jsonb"] * len(contains))
+        + ") ORDER BY c.doc_id NULLS LAST, CASE WHEN c.metadata->>'start_time' ~ '^[0-9]+(\\.[0-9]+)?$' "
+        "THEN (c.metadata->>'start_time')::float8 END NULLS LAST, c.id LIMIT %s"
+    )
     with read_only(dsn) as conn:
-        summaries = _hits(conn.execute(sql, (DEFAULT_SUMMARY_TYPES, ids, ids, ids, max(max_summaries, 0))).fetchall())
-        segments = _hits(conn.execute(sql, (DEFAULT_SEGMENT_TYPES, ids, ids, ids, max(max_segments, 0))).fetchall())
+        summaries = _hits(conn.execute(sql, (DEFAULT_SUMMARY_TYPES, ids, *contains, max(max_summaries, 0))).fetchall())
+        segments = _hits(conn.execute(sql, (DEFAULT_SEGMENT_TYPES, ids, *contains, max(max_segments, 0))).fetchall())
     return [h.to_document() for h in summaries], [h.to_document() for h in segments]
 
 
@@ -246,7 +282,7 @@ def _entity(vertex: Any, limit: int) -> dict[str, Any]:
     if not isinstance(vertex, dict):
         return {"value": vertex}
     props = dict(vertex.get("properties") or {})
-    for internal in ("labels", "neo4j_id", "embedding"):
+    for internal in ("labels", "neo4j_id", "embedding", NAME_KEY):
         props.pop(internal, None)
     name = props.pop("id", None) or props.get("name") or props.get("title")
     return {"label": vertex.get("label"), "name": name, "properties": _clip(props, limit)}
@@ -254,13 +290,16 @@ def _entity(vertex: Any, limit: int) -> dict[str, Any]:
 
 def _cypher(conn: "psycopg.Connection", graph: str, query: str, columns: Sequence[str],
             params: dict[str, Any]) -> list[list[Any]]:
-    """Run one fixed template. `query` is always a constant from this module."""
+    """Run one fixed template. `query` is always built in this module from constants and
+    validated labels/integers; caller values go only into `params` (bound, never text)."""
     from psycopg import sql
 
-    stmt = sql.SQL("SELECT * FROM ag_catalog.cypher({}, $$ " + query + " $$, %s) AS ({})").format(
-        sql.Literal(graph),
+    stmt = sql.Composed([
+        sql.SQL("SELECT * FROM ag_catalog.cypher("), sql.Literal(graph),
+        sql.SQL(", $$ " + query.replace("%", "%%") + " $$, %s) AS ("),
         sql.SQL(", ").join(sql.SQL("{} ag_catalog.agtype").format(sql.Identifier(c)) for c in columns),
-    )
+        sql.SQL(")"),
+    ])
     rows = conn.execute(stmt, (json.dumps(params),)).fetchall()
     return [[parse_agtype(v) for v in row] for row in rows]
 
@@ -275,6 +314,50 @@ def graph_labels(conn: "psycopg.Connection", graph: str = pg_store.GRAPH_NAME) -
     return {str(r[0]): str(r[1]) for r in rows}
 
 
+_SCHEMA_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+
+
+def _schema(conn: "psycopg.Connection", graph: str, labels: dict[str, str]) -> list[dict[str, Any]]:
+    """Labels with exact counts, cached for a few minutes (the graph changes rarely)."""
+    from psycopg import sql
+
+    key = f"{conn.info.host}:{conn.info.port}/{conn.info.dbname}/{graph}"
+    cached = _SCHEMA_CACHE.get(key)
+    if cached and time.monotonic() - cached[0] < SCHEMA_CACHE_SECONDS:
+        return cached[1]
+    counts = []
+    for name, kind in sorted(labels.items()):
+        row = conn.execute(sql.SQL("SELECT count(*) FROM {}").format(sql.Identifier(graph, name))).fetchone()
+        counts.append({"name": name, "kind": "node" if kind == "v" else "relationship",
+                       "count": int(row[0]) if row else 0})
+    _SCHEMA_CACHE[key] = (time.monotonic(), counts)
+    return counts
+
+
+def _connection_paths(conn: "psycopg.Connection", graph: str, params: dict[str, Any], hops: int,
+                      limit: int, snippet_limit: int) -> list[dict[str, Any]]:
+    """Shortest paths first: one fixed-length pattern per hop count, without passage links."""
+    paths: list[dict[str, Any]] = []
+    for length in range(1, hops + 1):
+        if len(paths) >= limit:
+            break
+        steps = "".join(f"-[r{i}]-(m{i})" for i in range(1, length)) + f"-[r{length}]-(b)"
+        where = " AND ".join(f"type(r{i}) <> '{rel}'" for i in range(1, length + 1) for rel in _PASSAGE_RELATIONSHIPS)
+        rows = _cypher(
+            conn, graph,
+            f"MATCH p = (a){steps} WHERE a.{NAME_KEY} = $q AND b.{NAME_KEY} = $b AND {where} "
+            f"RETURN p LIMIT {limit - len(paths)}",
+            ["p"], params,
+        )
+        for (path,) in rows:
+            nodes = path if isinstance(path, list) else []
+            paths.append({
+                "nodes": [_entity(n, snippet_limit) for n in nodes[0::2]],
+                "relationships": [r.get("label") for r in nodes[1::2] if isinstance(r, dict)],
+            })
+    return paths
+
+
 def graph_query(
     template: str,
     *,
@@ -287,45 +370,42 @@ def graph_query(
     dsn: str | None = None,
     graph: str = pg_store.GRAPH_NAME,
 ) -> dict[str, Any]:
-    """Run one read-only graph template. Entity matching ignores case.
+    """Run one read-only graph template. Entity names match ignoring case.
 
     - schema: node labels and relationship types, with counts
-    - find_entities: entities whose name contains `entity` (optionally only `label`)
+    - find_entities: entities (not source passages) whose name contains `entity`,
+      optionally only one node `label`
     - neighbors: everything one relationship away from the entity named `entity`
-    - connections: paths of up to `max_hops` relationships between `entity` and `other_entity`
+    - connections: shortest paths of up to `max_hops` relationships between `entity` and
+      `other_entity`, not through source passages
     - mentions: source passages (Document nodes) that mention the entity named `entity`
+
+    Matching uses the `name_lc` property neo4j_to_age writes on every node.
     """
     if template not in GRAPH_TEMPLATES:
         raise ValueError(f"template must be one of {GRAPH_TEMPLATES}, got {template!r}")
-    from psycopg import sql
-
     limit = max(1, min(int(limit), 50))
     with read_only(dsn) as conn:
         labels = graph_labels(conn, graph)
         if template == "schema":
-            counts = []
-            for name, kind in sorted(labels.items()):
-                row = conn.execute(sql.SQL("SELECT count(*) FROM {}").format(sql.Identifier(graph, name))).fetchone()
-                counts.append({"name": name, "kind": "node" if kind == "v" else "relationship",
-                               "count": int(row[0]) if row else 0})
-            return {"template": template, "rows": counts}
+            return {"template": template, "rows": _schema(conn, graph, labels)}
         if not entity.strip():
             raise ValueError(f"{template} needs `entity`")
-        params = {"q": entity.strip(), "limit": limit}
+        params = {"q": entity.strip().lower()}
         if template == "find_entities":
-            match = "(n)"
             if label:
                 if labels.get(label) != "v" or not _LABEL_NAME.match(label):
                     raise ValueError(f"unknown node label {label!r}; see the schema template")
-                match = f"(n:{label})"
-            rows = _cypher(conn, graph, f"MATCH {match} WHERE toLower(n.id) CONTAINS toLower($q) "
-                           "RETURN n LIMIT $limit", ["n"], params)
+                match, extra = f"(n:{label})", ""
+            else:
+                match, extra = "(n)", " AND label(n) <> 'Document'"
+            rows = _cypher(conn, graph, f"MATCH {match} WHERE n.{NAME_KEY} CONTAINS $q{extra} "
+                           f"RETURN n LIMIT {limit}", ["n"], params)
             return {"template": template, "rows": [_entity(r[0], snippet_limit) for r in rows]}
         if template == "neighbors":
             rows = _cypher(
                 conn, graph,
-                "MATCH (n)-[r]-(m) WHERE toLower(n.id) = toLower($q) "
-                "RETURN startNode(r) = n, type(r), m LIMIT $limit",
+                f"MATCH (n)-[r]-(m) WHERE n.{NAME_KEY} = $q RETURN startNode(r) = n, type(r), m LIMIT {limit}",
                 ["outgoing", "relationship", "other"], params,
             )
             return {"template": template, "entity": entity, "rows": [
@@ -335,26 +415,14 @@ def graph_query(
         if template == "mentions":
             rows = _cypher(
                 conn, graph,
-                "MATCH (d:Document)-[:MENTIONS]->(n) WHERE toLower(n.id) = toLower($q) RETURN d LIMIT $limit",
+                f"MATCH (d:Document)-[:MENTIONS]->(n) WHERE n.{NAME_KEY} = $q RETURN d LIMIT {limit}",
                 ["d"], params,
             ) if labels.get("Document") == "v" and labels.get("MENTIONS") == "e" else []
             return {"template": template, "entity": entity, "rows": [_entity(r[0], snippet_limit) for r in rows]}
         # connections
         if not other_entity.strip():
             raise ValueError("connections needs `other_entity`")
+        params["b"] = other_entity.strip().lower()
         hops = max(1, min(int(max_hops), MAX_GRAPH_HOPS))
-        params["b"] = other_entity.strip()
-        rows = _cypher(
-            conn, graph,
-            f"MATCH p = (a)-[*1..{hops}]-(b) WHERE toLower(a.id) = toLower($q) AND toLower(b.id) = toLower($b) "
-            "RETURN p LIMIT $limit",
-            ["p"], params,
-        )
-        paths = []
-        for (path,) in rows:
-            steps = path if isinstance(path, list) else []
-            paths.append({
-                "nodes": [_entity(s, snippet_limit) for s in steps[0::2]],
-                "relationships": [s.get("label") for s in steps[1::2] if isinstance(s, dict)],
-            })
+        paths = _connection_paths(conn, graph, params, hops, limit, snippet_limit)
         return {"template": template, "entity": entity, "other_entity": other_entity, "rows": paths}

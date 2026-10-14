@@ -8,10 +8,12 @@ Agent and UI LangChain tools stay on the CLIs.
 
 from __future__ import annotations
 
+import functools
 import os
-from typing import Any, Literal
+from typing import Any, Callable, Literal, TypeVar
 
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from starlette.middleware import Middleware
 from starlette.requests import Request
@@ -24,7 +26,7 @@ from src.mcp_server.caps import (
     DEFAULT_SNIPPET_LIMIT,
 )
 from src.mcp_server.rate_limit import IPRateLimitMiddleware
-from src.mcp_server.retrieval import backend
+from src.mcp_server.retrieval import backend, search_mode
 from src.mcp_server.retrieval import fetch as fetch_corpus
 from src.mcp_server.retrieval import search as search_corpus
 
@@ -33,9 +35,18 @@ _CHROMA_INSTRUCTIONS = (
     "Use search for semantic retrieval and fetch for a known episode_id or doc_id. "
     "Responses are attributed snippets, not full transcripts. No graph/Cypher tools."
 )
-_POSTGRES_INSTRUCTIONS = (
-    "Future of Education knowledge base (podcast, Substack, unique YouTube). "
-    "search is semantic; keyword_search matches exact words and phrases (quotes, OR, -word); "
+_SEARCH_STYLE = {"vector": "semantic", "keyword": "keyword", "hybrid": "hybrid (keyword + semantic)"}
+
+
+def _postgres_instructions() -> str:
+    return (
+        "Future of Education knowledge base (podcast, Substack, unique YouTube). "
+        f"search is {_SEARCH_STYLE[search_mode()]}; " + _POSTGRES_TOOLS
+    )
+
+
+_POSTGRES_TOOLS = (
+    "keyword_search matches exact words and phrases (quotes, OR, -word); "
     "vector_search is semantic by meaning; hybrid_search fuses both and is the best default "
     "for names and terms. fetch returns a known episode_id or doc_id. graph_query explores "
     "the entity graph (people, organizations, concepts) with fixed templates: start with "
@@ -43,10 +54,36 @@ _POSTGRES_INSTRUCTIONS = (
     "Responses are attributed snippets, not full transcripts."
 )
 
+# mask_error_details: unexpected errors (a database hiccup, say) reach public clients as a
+# generic message, never with hosts, roles or SQL. ToolError messages still go through.
 mcp = FastMCP(
     name="learningfocused",
-    instructions=_POSTGRES_INSTRUCTIONS if backend() == "postgres" else _CHROMA_INSTRUCTIONS,
+    instructions=_postgres_instructions() if backend() == "postgres" else _CHROMA_INSTRUCTIONS,
+    mask_error_details=True,
 )
+
+F = TypeVar("F", bound=Callable[..., Any])
+
+
+def _friendly_store_errors(fn: F) -> F:
+    """Turn Postgres outages and overload into a short, retryable tool error."""
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        import psycopg
+
+        from src.database.pg_search import StoreBusy
+
+        try:
+            return fn(*args, **kwargs)
+        except StoreBusy as exc:
+            raise ToolError("The knowledge base is busy; try again in a few seconds.") from exc
+        except psycopg.errors.QueryCanceled as exc:
+            raise ToolError("That query took too long; try a narrower one.") from exc
+        except psycopg.Error as exc:
+            raise ToolError("The knowledge base is unavailable right now; try again shortly.") from exc
+
+    return wrapper  # type: ignore[return-value]
 
 _READ_ONLY = {"readOnlyHint": True, "idempotentHint": True, "openWorldHint": False}
 
@@ -60,6 +97,7 @@ _READ_ONLY = {"readOnlyHint": True, "idempotentHint": True, "openWorldHint": Fal
         openWorldHint=False,
     ),
 )
+@_friendly_store_errors
 def search(
     query: str,
     max_segments: int = DEFAULT_MAX_SEGMENTS,
@@ -91,6 +129,7 @@ def search(
         openWorldHint=False,
     ),
 )
+@_friendly_store_errors
 def fetch(
     id: str,
     max_segments: int = DEFAULT_MAX_SEGMENTS,
@@ -124,6 +163,7 @@ def register_postgres_tools(server: FastMCP) -> None:
                              snippet_limit=snippet_limit, mode=mode)
 
     @server.tool(name="keyword_search", annotations=ToolAnnotations(title="Keyword search", **_READ_ONLY))
+    @_friendly_store_errors
     def keyword_search(
         query: str,
         max_segments: int = DEFAULT_MAX_SEGMENTS,
@@ -143,6 +183,7 @@ def register_postgres_tools(server: FastMCP) -> None:
         return _mode_search("keyword", query, max_segments, max_summaries, snippet_limit)
 
     @server.tool(name="vector_search", annotations=ToolAnnotations(title="Semantic search", **_READ_ONLY))
+    @_friendly_store_errors
     def vector_search(
         query: str,
         max_segments: int = DEFAULT_MAX_SEGMENTS,
@@ -160,6 +201,7 @@ def register_postgres_tools(server: FastMCP) -> None:
         return _mode_search("vector", query, max_segments, max_summaries, snippet_limit)
 
     @server.tool(name="hybrid_search", annotations=ToolAnnotations(title="Hybrid search", **_READ_ONLY))
+    @_friendly_store_errors
     def hybrid_search(
         query: str,
         max_segments: int = DEFAULT_MAX_SEGMENTS,
@@ -177,6 +219,7 @@ def register_postgres_tools(server: FastMCP) -> None:
         return _mode_search("hybrid", query, max_segments, max_summaries, snippet_limit)
 
     @server.tool(name="graph_query", annotations=ToolAnnotations(title="Explore the entity graph", **_READ_ONLY))
+    @_friendly_store_errors
     def graph_query(
         template: Literal["schema", "find_entities", "neighbors", "connections", "mentions"],
         entity: str = "",

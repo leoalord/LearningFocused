@@ -16,7 +16,7 @@ IAP tunnel (docs/postgres.md) and the admin DSN:
 
 Mapping: each node gets one AGE label (its first label other than `__Entity__`;
 AGE allows one) and keeps all Neo4j labels in a `labels` property plus its Neo4j
-elementId in `neo4j_id`. Relationship types map to AGE edge labels. Names are reduced to
+elementId in `neo4j_id`, plus `name_lc` (its `id` as a lower-case string) for lookups. Relationship types map to AGE edge labels. Names are reduced to
 [A-Za-z0-9_] (AGE reserves a leading underscore); the import refuses to start if two
 names would reduce to the same AGE label. `IngestedDoc` nodes are the indexer's
 bookkeeping (which source documents were processed), not knowledge, so they and their
@@ -43,6 +43,7 @@ IGNORED_LABELS = {"__Entity__", "__KGBuilder__"}
 # Nodes with these labels are not copied (src/pipeline/index_neo4j.py bookkeeping).
 SKIPPED_LABELS = ("IngestedDoc",)
 DEFAULT_DROP_PROPERTIES = ("embedding",)
+NAME_KEY = "name_lc"  # see node_properties; src/database/pg_search.py matches on it
 MAP_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS age_import_map (
     nid text PRIMARY KEY,           -- 'n:<neo4j elementId>' or 'e:<neo4j elementId>'
@@ -126,6 +127,12 @@ def node_properties(row: NodeRow, drop: Iterable[str]) -> str:
     props = {k: _jsonable(v) for k, v in row.props.items() if k not in dropped}
     props["labels"] = list(row.labels)
     props["neo4j_id"] = row.nid
+    # Lower-cased string form of the entity name, which graph lookups match on. Neo4j
+    # `id`s are usually strings but can be numbers or lists; a string copy keeps one odd
+    # node from breaking toLower() for every query.
+    name = props.get("id", props.get("name"))
+    if name is not None:
+        props[NAME_KEY] = (name if isinstance(name, str) else json.dumps(name)).lower()
     return json.dumps(props)
 
 

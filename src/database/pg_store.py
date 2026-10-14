@@ -5,8 +5,10 @@ sync/backfill in the pipeline modules, the same split as chroma_manager/index_ch
 
 Connection: `PG_DSN` (e.g. postgresql://learningfocused_app:...@10.138.0.5:5432/learningfocused).
 Cloud Run gets it from the `learningfocused-pg-dsn` secret; locally put it in `.env`.
-The DSN names the non-superuser app role that `migrate --app-role` creates; the
-`learningfocused` superuser is only for migrations and admin work over IAP.
+The DSN names the non-superuser app role that `migrate --app-role` creates (the daily
+job writes with it). The public MCP server uses a separate read-only role from
+`migrate --reader-role` (`learningfocused-pg-dsn-reader`). The `learningfocused`
+superuser is only for migrations and admin work over IAP.
 """
 
 from __future__ import annotations
@@ -26,6 +28,11 @@ SCHEMA_PATH = Path(__file__).with_name("pg_schema.sql")
 GRAPH_NAME = "knowledge"
 EMBEDDING_DIMS = 1536
 APP_ROLE_DEFAULT = "learningfocused_app"
+READER_ROLE_DEFAULT = "learningfocused_mcp"
+# Max MCP connections: 3 Cloud Run instances x PG_MAX_CONNECTIONS (4) plus headroom, so
+# a burst of public requests can't take the slots the daily job and admin need.
+READER_CONNECTION_LIMIT = 15
+CONNECT_TIMEOUT_S = 5
 # Set per connection (startup option), so a rollback can't drop ag_catalog from the path.
 # AGE itself is preloaded by the server (shared_preload_libraries), so no LOAD is needed.
 _SESSION_OPTIONS = '-c search_path=public,ag_catalog,"$user"'
@@ -61,7 +68,10 @@ def connect(dsn: str | None = None, *, autocommit: bool = False, extra_options: 
     import psycopg
 
     options = f"{_SESSION_OPTIONS} {extra_options}".strip()
-    conn = psycopg.connect(dsn or get_dsn(), autocommit=autocommit, options=options)
+    # connect_timeout: fail fast if the VM or the VPC path is down instead of holding a
+    # request for the TCP timeout.
+    conn = psycopg.connect(dsn or get_dsn(), autocommit=autocommit, options=options,
+                           connect_timeout=CONNECT_TIMEOUT_S)
     _register_vector(conn)
     return conn
 
@@ -123,6 +133,40 @@ def ensure_app_role(conn: "psycopg.Connection", role: str, password: str, graph:
     grant_graph_ownership(conn, role, graph)
 
 
+def ensure_reader_role(conn: "psycopg.Connection", role: str, password: str, graph: str = GRAPH_NAME,
+                       *, writers: tuple[str, ...] = ()) -> None:
+    """Create/refresh the read-only login the public MCP server uses.
+
+    SELECT only, read-only transactions by default, and a connection limit. `writers`
+    are roles that may create graph label tables later (the app role); tables they
+    create are readable by this role without re-running migrate.
+    """
+    from psycopg import sql
+
+    ident = sql.Identifier(role)
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (role,))
+        verb = "ALTER" if cur.fetchone() else "CREATE"
+        cur.execute(sql.SQL(verb + " ROLE {} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE CONNECTION LIMIT {} "
+                            "PASSWORD {}").format(ident, sql.Literal(READER_CONNECTION_LIMIT), sql.Literal(password)))
+        cur.execute(sql.SQL("ALTER ROLE {} SET default_transaction_read_only = on").format(ident))
+        cur.execute(sql.SQL("GRANT CONNECT ON DATABASE {} TO {}").format(sql.Identifier(conn.info.dbname), ident))
+        for stmt in (
+            "GRANT USAGE ON SCHEMA public TO {r}",
+            "GRANT SELECT ON ALL TABLES IN SCHEMA public TO {r}",
+            "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO {r}",
+            "GRANT USAGE ON SCHEMA ag_catalog TO {r}",
+            "GRANT SELECT ON ALL TABLES IN SCHEMA ag_catalog TO {r}",
+            "GRANT USAGE ON SCHEMA {g} TO {r}",
+            "GRANT SELECT ON ALL TABLES IN SCHEMA {g} TO {r}",
+            "ALTER DEFAULT PRIVILEGES IN SCHEMA {g} GRANT SELECT ON TABLES TO {r}",
+        ):
+            cur.execute(sql.SQL(stmt).format(r=ident, g=sql.Identifier(graph)))
+        for writer in writers:
+            cur.execute(sql.SQL("ALTER DEFAULT PRIVILEGES FOR ROLE {w} IN SCHEMA {g} GRANT SELECT ON TABLES TO {r}")
+                        .format(w=sql.Identifier(writer), g=sql.Identifier(graph), r=ident))
+
+
 def grant_graph_ownership(conn: "psycopg.Connection", role: str, graph: str = GRAPH_NAME) -> None:
     """Make `role` own every label table and sequence of the graph.
 
@@ -145,11 +189,13 @@ def grant_graph_ownership(conn: "psycopg.Connection", role: str, graph: str = GR
                 sql.Identifier(graph), sql.Identifier(relname), sql.Identifier(role)))
 
 
-def migrate(dsn: str | None = None, *, app_role: str | None = None,
-            app_password: str | None = None) -> dict[str, object]:
-    """Apply pg_schema.sql, create the graph and (optionally) the app role. Idempotent."""
+def migrate(dsn: str | None = None, *, app_role: str | None = None, app_password: str | None = None,
+            reader_role: str | None = None, reader_password: str | None = None) -> dict[str, object]:
+    """Apply pg_schema.sql, create the graph and (optionally) the app and reader roles. Idempotent."""
     if app_role and not app_password:
         raise ValueError("app_role needs app_password (set PG_APP_PASSWORD).")
+    if reader_role and not reader_password:
+        raise ValueError("reader_role needs reader_password (set PG_READER_PASSWORD).")
     sql_text = SCHEMA_PATH.read_text(encoding="utf-8")
     with connect(dsn, autocommit=True) as conn:
         conn.execute(sql_text)
@@ -157,8 +203,11 @@ def migrate(dsn: str | None = None, *, app_role: str | None = None,
         created = ensure_graph(conn)
         if app_role:
             ensure_app_role(conn, app_role, app_password or "")
+        if reader_role:
+            ensure_reader_role(conn, reader_role, reader_password or "",
+                               writers=(app_role,) if app_role else ())
     return {"schema": str(SCHEMA_PATH.name), "graph": GRAPH_NAME, "graph_created": created,
-            "app_role": app_role}
+            "app_role": app_role, "reader_role": reader_role}
 
 
 def status(dsn: str | None = None) -> dict[str, object]:
@@ -182,9 +231,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--app-role", nargs="?", const=APP_ROLE_DEFAULT, default=None,
                    help=f"also create/refresh the app login role (default name {APP_ROLE_DEFAULT}); "
                         "password from PG_APP_PASSWORD")
+    p.add_argument("--reader-role", nargs="?", const=READER_ROLE_DEFAULT, default=None,
+                   help=f"also create/refresh the read-only MCP login (default name {READER_ROLE_DEFAULT}); "
+                        "password from PG_READER_PASSWORD")
     args = p.parse_args(argv)
     if args.command == "migrate":
-        print(migrate(app_role=args.app_role, app_password=os.getenv("PG_APP_PASSWORD")))
+        print(migrate(app_role=args.app_role, app_password=os.getenv("PG_APP_PASSWORD"),
+                      reader_role=args.reader_role, reader_password=os.getenv("PG_READER_PASSWORD")))
     else:
         print(status())
     return 0

@@ -54,10 +54,17 @@ def _seed(dsn: str) -> None:
     with pg_store.session(dsn) as conn:
         upsert_batch(conn, [r[0] for r in rows], [r[1] for r in rows], [r[2] for r in rows],
                      [np.asarray(r[3], dtype=np.float32) for r in rows], SyncStats())
+        # name_lc as neo4j_to_age writes it. The odd nodes are what Neo4j can hold: a
+        # passage whose id is a content hash, a numeric id, and a node with no name.
         conn.execute("""SELECT * FROM ag_catalog.cypher('knowledge', $$
-            CREATE (p:Person {id: 'MacKenzie Price'})-[:FOUNDED]->(o:Organization {id: 'Alpha School'}),
-                   (d:Document {text: 'Alpha School uses two hour learning', title: 'Ep 7'})-[:MENTIONS]->(o),
-                   (o)-[:IMPLEMENTS]->(c:Concept {id: 'Two Hour Learning'})
+            CREATE (p:Person {id: 'MacKenzie Price', name_lc: 'mackenzie price'})
+                     -[:FOUNDED]->(o:Organization {id: 'Alpha School', name_lc: 'alpha school'}),
+                   (d:Document {id: 'a1b2c3', name_lc: 'a1b2c3', text: 'Alpha School uses two hour learning',
+                                title: 'Ep 7'})-[:MENTIONS]->(o),
+                   (d)-[:MENTIONS]->(p),
+                   (o)-[:IMPLEMENTS]->(c:Concept {id: 'Two Hour Learning', name_lc: 'two hour learning'}),
+                   (:Tool {id: 42, name_lc: '42'}),
+                   (:Event {title: 'no name'})
             $$) AS (x ag_catalog.agtype)""")
 
 
@@ -75,11 +82,8 @@ class TestPostgresRetrieval(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.db = TempDatabase().__enter__()
+        cls.addClassCleanup(cls.db.__exit__, None, None, None)
         _seed(cls.db.dsn)
-
-    @classmethod
-    def tearDownClass(cls) -> None:
-        cls.db.__exit__(None, None, None)
 
     def test_keyword_vector_hybrid(self) -> None:
         from src.database import pg_search
@@ -113,13 +117,20 @@ class TestPostgresRetrieval(unittest.TestCase):
         self.assertEqual(schema["FOUNDED"], "relationship")
         found = pg_search.graph_query("find_entities", entity="alpha", dsn=dsn)["rows"]
         self.assertEqual([r["name"] for r in found], ["Alpha School"])
+        # Source passages aren't entities: a hash id never matches a short query.
+        self.assertEqual(pg_search.graph_query("find_entities", entity="a1", dsn=dsn)["rows"], [])
+        self.assertEqual([r["name"] for r in pg_search.graph_query("find_entities", entity="42", dsn=dsn)["rows"]],
+                         [42])
         self.assertEqual(pg_search.graph_query("find_entities", entity="alpha", label="Person", dsn=dsn)["rows"], [])
         near = pg_search.graph_query("neighbors", entity="ALPHA SCHOOL", dsn=dsn)["rows"]
         self.assertIn({"direction": "in", "relationship": "FOUNDED",
                        "other": {"label": "Person", "name": "MacKenzie Price", "properties": {}}}, near)
         paths = pg_search.graph_query("connections", entity="mackenzie price", other_entity="two hour learning",
-                                      dsn=dsn)["rows"]
-        self.assertEqual(paths[0]["relationships"], ["FOUNDED", "IMPLEMENTS"])
+                                      max_hops=3, dsn=dsn)["rows"]
+        self.assertEqual([p["relationships"] for p in paths], [["FOUNDED", "IMPLEMENTS"]])  # not via the passage
+        direct = pg_search.graph_query("connections", entity="MacKenzie Price", other_entity="Alpha School",
+                                       max_hops=3, dsn=dsn)["rows"]
+        self.assertEqual(direct[0]["relationships"], ["FOUNDED"])  # shortest first
         mentions = pg_search.graph_query("mentions", entity="Alpha School", dsn=dsn)["rows"]
         self.assertEqual(mentions[0]["properties"]["text"], "Alpha School uses two hour learning")
 
@@ -136,6 +147,38 @@ class TestPostgresRetrieval(unittest.TestCase):
         rows = pg_search.graph_query("find_entities", entity="' }) MATCH (n) DETACH DELETE n //", dsn=self.db.dsn)
         self.assertEqual(rows["rows"], [])
         self.assertEqual(len(pg_search.graph_query("find_entities", entity="a", dsn=self.db.dsn)["rows"]), 3)
+
+    def test_reader_role_can_search_but_never_write(self) -> None:
+        import psycopg
+
+        from src.database import pg_search, pg_store
+        from src.tests.pg_testutil import with_credentials
+
+        pg_store.migrate(self.db.dsn, app_role="lf_app_t", app_password="app-pw",
+                         reader_role="lf_reader_t", reader_password="reader-pw")
+        reader = with_credentials(self.db.dsn, "lf_reader_t", "reader-pw")
+        self.assertEqual(len(pg_search.graph_query("neighbors", entity="alpha school", dsn=reader)["rows"]), 3)
+        _, segs = pg_search.fetch_documents("post-1", max_segments=5, max_summaries=0, dsn=reader)
+        self.assertEqual(len(segs), 1)
+        conn = psycopg.connect(reader, autocommit=True)
+        try:
+            conn.execute("SET default_transaction_read_only = off")
+            with self.assertRaises(psycopg.errors.InsufficientPrivilege):
+                conn.execute("DELETE FROM chunks")
+        finally:
+            conn.close()
+
+    def test_connection_slots_are_capped(self) -> None:
+        from src.database import pg_search
+
+        with patch.object(pg_search, "_SLOTS", __import__("threading").BoundedSemaphore(1)), \
+                patch.object(pg_search, "SLOT_WAIT_SECONDS", 0.05):
+            with pg_search.read_only(self.db.dsn):
+                with self.assertRaises(pg_search.StoreBusy):
+                    with pg_search.read_only(self.db.dsn):
+                        pass
+            with pg_search.read_only(self.db.dsn):  # the slot came back
+                pass
 
     def test_connections_are_read_only(self) -> None:
         import psycopg
@@ -166,8 +209,20 @@ class TestPostgresRetrieval(unittest.TestCase):
             return names, kw, graph, bad
 
         env = {"KB_BACKEND": "postgres", "PG_DSN": self.db.dsn}
+        down = {"KB_BACKEND": "postgres", "PG_DSN": "postgresql://nobody@127.0.0.1:1/x"}
         with patch.dict(os.environ, env), patch.object(pg_search, "embed_query", _fake_embed):
             names, kw, graph, bad = asyncio.run(go())
+
+        async def unreachable():
+            async with Client(server) as client:
+                return await client.call_tool("keyword_search", {"query": "x"}, raise_on_error=False)
+
+        with patch.dict(os.environ, down):
+            failed = asyncio.run(unreachable())
+        self.assertTrue(failed.is_error)
+        text = failed.content[0].text
+        self.assertIn("unavailable", text)
+        self.assertNotIn("127.0.0.1", text)
         self.assertEqual(names, ["graph_query", "hybrid_search", "keyword_search", "vector_search"])
         self.assertEqual([s.metadata["chunk_id"] for s in kw.data.segments], ["art-1"])
         self.assertEqual(len(graph.structured_content["rows"]), 3)
@@ -198,10 +253,34 @@ class TestBackendSwitch(unittest.TestCase):
         self.assertEqual(fetch.call_args.args[0], "S2 E7")
 
     def test_daily_job_does_not_roll_a_postgres_mcp(self) -> None:
-        from src.pipeline.daily_ingest import mcp_backend
+        from unittest.mock import MagicMock
 
-        self.assertEqual(mcp_backend({"env": [{"name": "KB_BACKEND", "value": "postgres"}]}), "postgres")
-        self.assertEqual(mcp_backend({"env": []}), "chroma")
+        from src.pipeline import daily_ingest
+
+        self.assertEqual(daily_ingest.mcp_backend({"env": []}), "chroma")
+        service = {"template": {"containers": [{"env": [{"name": "KB_BACKEND", "value": "postgres"}]}],
+                                "scaling": {"minInstanceCount": 0}}}
+        session = MagicMock()
+        session.get.return_value = MagicMock(ok=True, json=lambda: service)
+        with patch("google.auth.default", return_value=(MagicMock(spec=[]), "p")), \
+                patch("google.auth.transport.requests.AuthorizedSession", return_value=session):
+            result = daily_ingest.roll_mcp_service(project="p", region="r", service="s", snapshot_at="t")
+        self.assertTrue(result["skipped"])  # min instances 0 is fine: nothing to roll
+        session.patch.assert_not_called()
+
+    def test_postgres_mcp_without_a_fresh_copy_fails_the_run(self) -> None:
+        from src.feeds.registry import SourceConfig
+        from src.pipeline import daily_ingest
+
+        skipped = {"service": "s", "skipped": True, "reason": "KB_BACKEND=postgres reads live data"}
+        registry = [SourceConfig(key="art19", kind="podcast_rss", name="a")]
+        with patch.object(daily_ingest, "roll_mcp_service", return_value=skipped), \
+                patch("src.feeds.state.is_enabled", return_value=False):
+            ledger = daily_ingest.run(hydrate=False, sync=False, roll=True, registry=registry,
+                                      source_runners={"art19": lambda: {}})
+        self.assertFalse(ledger["mcp_roll"]["ok"])
+        self.assertIn("no PG_DSN", ledger["mcp_roll"]["reason"])
+        self.assertFalse(ledger["ok"])
 
 
 if __name__ == "__main__":

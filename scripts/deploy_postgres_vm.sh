@@ -31,6 +31,9 @@ SECRET_PASSWORD="${SECRET_PG_PASSWORD:-learningfocused-pg-password}"
 SECRET_APP_PASSWORD="${SECRET_PG_APP_PASSWORD:-learningfocused-pg-app-password}"
 APP_ROLE="${PG_APP_ROLE:-learningfocused_app}"
 SECRET_DSN="${SECRET_PG_DSN:-learningfocused-pg-dsn}"
+SECRET_READER_PASSWORD="${SECRET_PG_READER_PASSWORD:-learningfocused-pg-reader-password}"
+READER_ROLE="${PG_READER_ROLE:-learningfocused_mcp}"
+SECRET_READER_DSN="${SECRET_PG_READER_DSN:-learningfocused-pg-dsn-reader}"
 SNAPSHOT_POLICY="${PG_SNAPSHOT_POLICY:-learningfocused-pg-weekly}"
 
 gcloud config set project "${PROJECT}" >/dev/null
@@ -67,6 +70,7 @@ ensure_password_secret() {
 }
 ensure_password_secret "${SECRET_PASSWORD}"
 ensure_password_secret "${SECRET_APP_PASSWORD}"
+ensure_password_secret "${SECRET_READER_PASSWORD}"
 
 if ! gcloud iam service-accounts describe "${SA_EMAIL}" --project="${PROJECT}" >/dev/null 2>&1; then
   echo ">> Creating VM service account ${SA_EMAIL}"
@@ -159,24 +163,30 @@ fi
 
 PG_IP="$(gcloud compute instances describe "${VM}" --zone="${ZONE}" --project="${PROJECT}" \
   --format='value(networkInterfaces[0].networkIP)')"
-PASSWORD="$(gcloud secrets versions access latest --secret="${SECRET_APP_PASSWORD}" --project="${PROJECT}")"
-DSN="postgresql://${APP_ROLE}:${PASSWORD}@${PG_IP}:5432/learningfocused"
-if ! gcloud secrets describe "${SECRET_DSN}" --project="${PROJECT}" >/dev/null 2>&1; then
-  gcloud secrets create "${SECRET_DSN}" --replication-policy=automatic --project="${PROJECT}"
-fi
-CURRENT_DSN="$(gcloud secrets versions access latest --secret="${SECRET_DSN}" --project="${PROJECT}" 2>/dev/null || true)"
-if [[ "${CURRENT_DSN}" != "${DSN}" ]]; then
-  echo ">> Storing DSN in secret ${SECRET_DSN}"
-  printf '%s' "${DSN}" | gcloud secrets versions add "${SECRET_DSN}" --data-file=- --project="${PROJECT}" >/dev/null
-fi
-unset PASSWORD DSN CURRENT_DSN
+# store_dsn <dsn secret> <role> <password secret>: keep a DSN secret pointing at this VM.
+store_dsn() {
+  local secret="$1" role="$2" password_secret="$3" password dsn current
+  password="$(gcloud secrets versions access latest --secret="${password_secret}" --project="${PROJECT}")"
+  dsn="postgresql://${role}:${password}@${PG_IP}:5432/learningfocused"
+  if ! gcloud secrets describe "${secret}" --project="${PROJECT}" >/dev/null 2>&1; then
+    gcloud secrets create "${secret}" --replication-policy=automatic --project="${PROJECT}"
+  fi
+  current="$(gcloud secrets versions access latest --secret="${secret}" --project="${PROJECT}" 2>/dev/null || true)"
+  if [[ "${current}" != "${dsn}" ]]; then
+    echo ">> Storing DSN in secret ${secret}"
+    printf '%s' "${dsn}" | gcloud secrets versions add "${secret}" --data-file=- --project="${PROJECT}" >/dev/null
+  fi
+}
+store_dsn "${SECRET_DSN}" "${APP_ROLE}" "${SECRET_APP_PASSWORD}"
+store_dsn "${SECRET_READER_DSN}" "${READER_ROLE}" "${SECRET_READER_PASSWORD}"
 
 echo
 echo "VM:        ${VM} (${ZONE}, ${MACHINE_TYPE}, internal IP ${PG_IP})"
 echo "Image:     ${IMAGE_REF}"
 echo "Data disk: ${DATA_DISK} (weekly snapshots: ${SNAPSHOT_POLICY})"
 echo "Dumps:     gs://${BUCKET}/pg_dumps/ nightly 03:30 UTC"
-echo "DSN:       secret ${SECRET_DSN} (role ${APP_ROLE}; Cloud Run reads it as PG_DSN)"
+echo "DSN:       secret ${SECRET_DSN} (role ${APP_ROLE}, read-write; the daily job reads it as PG_DSN)"
+echo "Reader:    secret ${SECRET_READER_DSN} (role ${READER_ROLE}, read-only; the MCP server reads it as PG_DSN)"
 echo
-echo "Next: apply the schema and create ${APP_ROLE} through an IAP tunnel (see docs/postgres.md),"
+echo "Next: apply the schema and create ${APP_ROLE} + ${READER_ROLE} through an IAP tunnel (see docs/postgres.md),"
 echo "then ./scripts/pg_backup.sh dump-now and ./scripts/pg_backup.sh restore-test."
