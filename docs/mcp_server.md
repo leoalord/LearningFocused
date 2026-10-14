@@ -68,7 +68,7 @@ uv run python -m evals.run
 
 ## Cloud Run (LearningFocus / us-west1)
 
-One GCP project: LearningFocus (`gen-lang-client-0304733057`, same as `.env` `GCP_PROJECT_ID`). Do **not** deploy to `inferpoker`; that project belongs to InferPoker.
+One GCP project: LearningFocus (`gen-lang-client-0304733057`, the scripts' default; `GCP_BACKUP_PROJECT` overrides it, see `scripts/_gcp_env.sh`). Do **not** deploy to `inferpoker`; that project belongs to InferPoker.
 
 | | |
 | --- | --- |
