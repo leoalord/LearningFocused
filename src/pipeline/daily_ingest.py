@@ -1,11 +1,14 @@
 """Daily ingest orchestrator (TASK-19).
 
-One entrypoint walks Art19 RSS, Substack, and unique YouTube. Per-source
-failures are isolated: one raising does not abort the others. Every run writes
-a ledger (local + GCS). After ingest, artifacts + chroma_db are checksum-synced
-to the same private bucket and the public MCP Cloud Run service is rolled so
-warm instances rehydrate. Neo4j is skipped. Existing files are not re-transcribed.
-The YouTube V1 cap is not raised. The MCP service is not scaled to zero.
+One entrypoint checks every feed in the registry (src/feeds/sources.json) that is
+due today: Art19 podcast RSS, Substack, the whole @future_of_education YouTube
+channel (new uploads, deduplicated against podcast episodes), and social accounts
+once they are configured. Per-source failures are isolated: one raising does not
+abort the others. Every run writes a ledger (local + GCS) and, when PG_DSN is set,
+rows in ingest_runs / source_checks. After ingest, artifacts + chroma_db are
+checksum-synced to the private bucket and the public MCP Cloud Run service is rolled
+so warm instances rehydrate. Neo4j is skipped. Existing files are not re-transcribed.
+The MCP service is not scaled to zero.
 """
 
 from __future__ import annotations
@@ -21,7 +24,9 @@ from typing import Any, Callable, Sequence
 
 from dotenv import load_dotenv
 
-from src.config import LEDGER_DIR, ensure_data_dirs
+from src.config import LEDGER_DIR, RSS_FEED_URL, SUBSTACK_FEED_URL, ensure_data_dirs
+from src.feeds import state as feed_state
+from src.feeds.registry import SOCIAL_KINDS, SourceConfig, due_sources, load_sources
 from src.gcs_corpus import (
     LEDGER_PREFIX,
     default_bucket,
@@ -35,10 +40,11 @@ from src.gcs_corpus import (
 SOURCE_ART19 = "art19"
 SOURCE_SUBSTACK = "substack"
 SOURCE_YOUTUBE = "youtube"
-DEFAULT_SOURCES = (SOURCE_ART19, SOURCE_SUBSTACK, SOURCE_YOUTUBE)
 MCP_SERVICE_DEFAULT = "learningfocused-mcp"
 MCP_REGION_DEFAULT = "us-west1"
 DEFAULT_ART19_DOWNLOAD_LIMIT = 5
+DEFAULT_SUBSTACK_INGEST_LIMIT = 10
+DEFAULT_YOUTUBE_MAX_NEW = 10
 CHROMA_SNAPSHOT_ENV = "CHROMA_SNAPSHOT_AT"
 
 SourceRunner = Callable[[], dict[str, Any]]
@@ -56,44 +62,108 @@ def _run_id(ts: datetime) -> str:
     return ts.strftime("%Y%m%dT%H%M%SZ")
 
 
-def run_art19() -> dict[str, Any]:
+def run_art19(download_limit: int = DEFAULT_ART19_DOWNLOAD_LIMIT) -> dict[str, Any]:
     """Art19 / podcast RSS. Skip Neo4j. Do not --reset-chroma."""
     from src.pipeline.audio.run import main as audio_main
 
-    limit = os.getenv("DAILY_ART19_DOWNLOAD_LIMIT", str(DEFAULT_ART19_DOWNLOAD_LIMIT))
+    limit = os.getenv("DAILY_ART19_DOWNLOAD_LIMIT", str(download_limit))
     argv = ["--skip-neo4j", "--", "--mode", "daily", "--download-limit", str(limit)]
     print(f"\n=== SOURCE art19 ===\npython -m src.pipeline.audio.run {' '.join(argv)}")
     audio_main(argv)
     return {"argv": argv}
 
 
-def run_substack() -> dict[str, Any]:
+def run_substack(ingest_limit: int = DEFAULT_SUBSTACK_INGEST_LIMIT) -> dict[str, Any]:
     """Substack daily ingest. Skip Neo4j. Do not --reset-chroma."""
     from src.pipeline.substack.run import main as substack_main
 
-    argv = ["--skip-neo4j", "--", "--mode", "daily", "--ingest-limit", "10"]
+    argv = ["--skip-neo4j", "--", "--mode", "daily", "--ingest-limit", str(ingest_limit)]
     print(f"\n=== SOURCE substack ===\npython -m src.pipeline.substack.run {' '.join(argv)}")
     substack_main(argv)
     return {"argv": argv}
 
 
-def run_youtube() -> dict[str, Any]:
-    """Unique YouTube with existing skip.py + V1 cap. No --force. No --reset-chroma."""
+def run_youtube(max_new: int = DEFAULT_YOUTUBE_MAX_NEW) -> dict[str, Any]:
+    """Whole-channel YouTube feed (videos tab + listed playlists) with skip.py dedupe.
+
+    No --force. No --reset-chroma. At most `max_new` new videos per run.
+    """
     from src.pipeline.youtube.run import main as youtube_main
 
-    argv: list[str] = []
-    print("\n=== SOURCE youtube ===\npython -m src.pipeline.youtube.run")
+    argv = ["--feed", "--max-new", str(max_new)]
+    print(f"\n=== SOURCE youtube ===\npython -m src.pipeline.youtube.run {' '.join(argv)}")
     code = youtube_main(argv)
     if code not in (0, 1):
         raise RuntimeError(f"youtube.run exited {code} (refused or unexpected)")
     return {"argv": argv, "exit_code": code}
 
 
-DEFAULT_RUNNERS: dict[str, SourceRunner] = {
-    SOURCE_ART19: run_art19,
-    SOURCE_SUBSTACK: run_substack,
-    SOURCE_YOUTUBE: run_youtube,
-}
+# Used only when sources.json can't be read, so a bad edit never stops the core feeds.
+FALLBACK_REGISTRY = [
+    SourceConfig(key=SOURCE_ART19, kind="podcast_rss", name="Art19", url=RSS_FEED_URL),
+    SourceConfig(key=SOURCE_SUBSTACK, kind="substack", name="Substack", url=SUBSTACK_FEED_URL),
+    SourceConfig(key=SOURCE_YOUTUBE, kind="youtube_channel", name="YouTube"),
+]
+
+
+def _int_config(source: SourceConfig, name: str, default: int) -> int:
+    value = source.config.get(name, default)
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(f"source {source.key}: config.{name} must be a non-negative integer, got {value!r}")
+    return value
+
+
+def _require_builtin_url(source: SourceConfig, builtin: str) -> None:
+    # The audio and Substack pipelines read their feed URL from src.config; a second
+    # podcast or Substack needs those pipelines parameterised first.
+    if source.url and source.url.rstrip("/") != builtin.rstrip("/"):
+        raise NotImplementedError(
+            f"source {source.key}: only {builtin} is supported for kind {source.kind} today"
+        )
+
+
+def runner_for(source: SourceConfig) -> SourceRunner:
+    """Build the runner for one registry entry. Config errors raise when it runs,
+    so they land in that source's ledger entry instead of stopping the job."""
+
+    def run_source() -> dict[str, Any]:
+        if source.kind == "podcast_rss":
+            _require_builtin_url(source, RSS_FEED_URL)
+            return run_art19(_int_config(source, "download_limit", DEFAULT_ART19_DOWNLOAD_LIMIT))
+        if source.kind == "substack":
+            _require_builtin_url(source, SUBSTACK_FEED_URL)
+            return run_substack(_int_config(source, "ingest_limit", DEFAULT_SUBSTACK_INGEST_LIMIT))
+        if source.kind == "youtube_channel":
+            return run_youtube(_int_config(source, "max_new_per_run", DEFAULT_YOUTUBE_MAX_NEW))
+        if source.kind in SOCIAL_KINDS:
+            from src.feeds.social import run_social
+
+            return run_social(source)
+        raise NotImplementedError(f"source {source.key}: no runner for kind {source.kind}")
+
+    return run_source
+
+
+def _pg_step(ledger: dict[str, Any], name: str, fn: Callable[[], Any]) -> Any:
+    """Postgres bookkeeping never blocks ingest: record the outcome and carry on."""
+    try:
+        result = fn()
+    except Exception as exc:  # noqa: BLE001
+        ledger["pg_state"][name] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        ledger["errors"].append(f"pg_state.{name}: {exc}")
+        print(f"WARNING: Postgres feed state ({name}) failed: {exc}")
+        return None
+    ledger["pg_state"][name] = {"ok": True}
+    return result
+
+
+def _load_registry(ledger: dict[str, Any]) -> list[SourceConfig]:
+    try:
+        return load_sources()
+    except Exception as exc:  # noqa: BLE001
+        ledger["errors"].append(f"registry: {type(exc).__name__}: {exc}")
+        print(f"WARNING: could not read sources.json, using the built-in feeds: {exc}")
+        return list(FALLBACK_REGISTRY)
 
 
 def _write_ledger_local(payload: dict[str, Any], run_id: str) -> Path:
@@ -275,20 +345,27 @@ def _wait_run_operation(session: Any, op_name: str, *, timeout_s: int) -> None:
 def run(
     *,
     sources: Sequence[str] | None = None,
+    skip: Sequence[str] = (),
     hydrate: bool = True,
     sync: bool = True,
     roll: bool = True,
     dry_run: bool = False,
     source_runners: dict[str, SourceRunner] | None = None,
+    registry: list[SourceConfig] | None = None,
 ) -> dict[str, Any]:
+    """Run `sources` (registry keys), or with sources=None every registry source due today.
+
+    `source_runners` replaces the registry runners (tests). With PG_DSN set, the registry
+    is mirrored to Postgres, weekly sources use their last check from there, and the run
+    is recorded; none of that can fail the run.
+    """
     load_dotenv()
     ensure_data_dirs()
     started = _utc_now()
     run_id = _run_id(started)
-    wanted = tuple(sources or DEFAULT_SOURCES)
-    runners = source_runners or DEFAULT_RUNNERS
     # Ledger goes to GCS when this process is already talking to the bucket.
     write_gcs = (not dry_run) and (hydrate or sync)
+    use_pg = (not dry_run) and feed_state.is_enabled()
 
     ledger: dict[str, Any] = {
         "run_id": run_id,
@@ -300,11 +377,29 @@ def run(
         "bucket": default_bucket(),
         "schedule_note": "Cloud Scheduler: 0 8 * * * America/Los_Angeles (learningfocused-ingest-daily)",
         "hydrate": None,
-        "sources": {name: {"ok": None} for name in wanted},
+        "sources": {},
         "gcs_sync": None,
         "mcp_roll": None,
+        "pg_state": {},
         "errors": [],
     }
+
+    if registry is None:
+        registry = _load_registry(ledger)
+    by_key = {s.key: s for s in registry}
+    if sources is None:
+        last_checked: dict[str, datetime] = {}
+        if use_pg:
+            _pg_step(ledger, "sync_registry", lambda: feed_state.sync_registry(registry or []))
+            last_checked = _pg_step(ledger, "last_checked", feed_state.last_checked) or {}
+        due = due_sources(registry, now=started, last_checked=last_checked)
+        sources = [s.key for s in due]
+    wanted = tuple(name for name in sources if name not in set(skip))
+    runners: dict[str, SourceRunner] = (
+        dict(source_runners) if source_runners is not None
+        else {key: runner_for(src) for key, src in by_key.items()}
+    )
+    ledger["sources"] = {name: {"ok": None} for name in wanted}
     persist_ledger(ledger, run_id, to_gcs=write_gcs)
 
     if hydrate and not dry_run:
@@ -321,6 +416,8 @@ def run(
                     "error": "hydrate_failed",
                 }
             ledger["finished_at"] = _iso(_utc_now())
+            if use_pg:
+                _pg_step(ledger, "record_run", lambda: feed_state.record_run(ledger))
             persist_ledger(ledger, run_id, to_gcs=True)
             return ledger
     elif dry_run:
@@ -378,6 +475,8 @@ def run(
     roll_ok = bool(ledger.get("mcp_roll") and ledger["mcp_roll"].get("ok"))
     ledger["ok"] = bool(source_ok and sync_ok and roll_ok and (ledger.get("hydrate") or {}).get("ok"))
     ledger["finished_at"] = _iso(_utc_now())
+    if use_pg:
+        _pg_step(ledger, "record_run", lambda: feed_state.record_run(ledger))
     persist_ledger(ledger, run_id, to_gcs=write_gcs)
     print(json.dumps({"run_id": run_id, "ok": ledger["ok"], "sources": {
         n: {"ok": (ledger["sources"][n] or {}).get("ok")} for n in wanted
@@ -388,8 +487,10 @@ def run(
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="python -m src.pipeline.daily_ingest",
-        description="Isolated daily ingest of Art19 + Substack + unique YouTube, then GCS sync + MCP roll.",
+        description="Check every due feed in src/feeds/sources.json (isolated), then GCS sync + MCP roll.",
     )
+    p.add_argument("--source", action="append", dest="only", metavar="KEY",
+                   help="Run only this registry key, due or not (repeatable).")
     p.add_argument("--dry-run", action="store_true", help="Walk sources without calling pipelines, GCS, or MCP roll.")
     p.add_argument("--skip-hydrate", action="store_true", help="Do not pull chroma/artifacts from GCS (local laptop).")
     p.add_argument("--skip-sync", action="store_true", help="Do not upload artifacts/chroma to GCS.")
@@ -397,23 +498,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--skip-art19", action="store_true")
     p.add_argument("--skip-substack", action="store_true")
     p.add_argument("--skip-youtube", action="store_true")
+    p.add_argument("--skip", action="append", default=[], metavar="KEY", help="Skip this registry key (repeatable).")
     return p
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    sources = []
-    if not args.skip_art19:
-        sources.append(SOURCE_ART19)
-    if not args.skip_substack:
-        sources.append(SOURCE_SUBSTACK)
-    if not args.skip_youtube:
-        sources.append(SOURCE_YOUTUBE)
-    if not sources:
+    skip = list(args.skip)
+    for flag, key in ((args.skip_art19, SOURCE_ART19), (args.skip_substack, SOURCE_SUBSTACK),
+                      (args.skip_youtube, SOURCE_YOUTUBE)):
+        if flag:
+            skip.append(key)
+    if args.only and all(key in skip for key in args.only):
         print("No sources selected.")
         return 2
     ledger = run(
-        sources=sources,
+        sources=args.only,
+        skip=skip,
         hydrate=not args.skip_hydrate,
         sync=not args.skip_sync,
         roll=not args.skip_roll,

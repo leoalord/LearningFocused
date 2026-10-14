@@ -87,6 +87,9 @@ Skip (do not ingest as new corpus):
   Never skip on duration alone.
 
 V1 cap (default): all appearances (6) + 3 Gifted Minds branding + 3 unique long-form + 3 curated Shorts.
+Feed (--feed, the daily job): Appearances + About Gifted Minds playlists, then the whole
+  @future_of_education Videos tab newest first; every upload not yet ingested and not a
+  podcast duplicate, at most --max-new per run (default 10). Shorts are not walked.
 Refused: --channel, --reset-chroma, UU dump, @thealphaschool, Shorts-tab bulk.
 """.strip()
 
@@ -247,6 +250,92 @@ def select_v1_candidates(
         if len(selected) > before:
             short_added += 1
 
+    return selected, skipped
+
+
+FEED_MAX_NEW_DEFAULT = 10
+
+
+def _already_ingested(video_id: str) -> bool:
+    """Same artifact check ingest_one uses to skip work (hydrated from GCS in the job)."""
+    return (
+        transcript_exists(video_id) is not None
+        and (YOUTUBE_SEGMENTED_DIR / f"{video_id}.json").is_file()
+        and (YOUTUBE_SUMMARIES_DIR / f"{video_id}.json").is_file()
+    )
+
+
+def feed_listings() -> list[tuple[str, str, str | None, bool]]:
+    """(url, bucket, playlist_id, allow_same_recording) for the channel feed, in walk order.
+
+    Small playlists first (they hold the off-channel appearances), then the whole
+    @future_of_education Videos tab, newest first. Shorts are not walked here.
+    """
+    return [
+        (PLAYLIST_URLS["appearances"], BUCKET_APPEARANCE, PLAYLIST_APPEARANCES, False),
+        (PLAYLIST_URLS["about_gifted_minds"], BUCKET_BRANDING, PLAYLIST_ABOUT_GIFTED_MINDS, True),
+        (VIDEOS_TAB_URL, BUCKET_UNIQUE_LONGFORM, None, True),
+    ]
+
+
+def select_feed_candidates(
+    *,
+    rss_entries: list[dict[str, Any]],
+    episodes_ids: set[str],
+    max_new: int = FEED_MAX_NEW_DEFAULT,
+    listings: list[tuple[str, str, str | None, bool]] | None = None,
+    already_ingested: Any = None,
+) -> tuple[list[Candidate], list[SkipDecision]]:
+    """Every channel upload not yet ingested and not a podcast duplicate, up to max_new.
+
+    Podcast twins are skipped with the same rules as V1 (title match, same recording,
+    Gifted Minds Episodes playlist, RSS intro twins), so a transcript is never stored
+    twice. Already-ingested videos are passed over without counting toward max_new.
+    """
+    is_done = already_ingested or _already_ingested
+    selected: list[Candidate] = []
+    skipped: list[SkipDecision] = []
+    seen: set[str] = set()
+    for url, bucket, playlist_id, allow_same_recording in listings or feed_listings():
+        if len(selected) >= max_new:
+            break
+        for info in _flat_items(url, allow_videos_tab=(url == VIDEOS_TAB_URL)):
+            if len(selected) >= max_new:
+                break
+            video_id = str(info.get("video_id") or "")
+            if not video_id or video_id in seen:
+                continue
+            seen.add(video_id)
+            if video_id == SKIP_PROOF_VIDEO_ID or is_done(video_id):
+                continue
+            title = str(info.get("title") or "")
+            duration = info.get("duration_seconds")
+            duration_i = int(duration) if isinstance(duration, (int, float)) else None
+            decision = skip_decision(
+                video_id=video_id,
+                title=title,
+                duration_seconds=duration_i,
+                rss_entries=rss_entries,
+                episodes_playlist_ids=episodes_ids,
+                playlist_id=playlist_id,
+                allow_same_recording=allow_same_recording,
+            )
+            if decision:
+                skipped.append(decision)
+                continue
+            selected.append(
+                Candidate(
+                    video_id=video_id,
+                    title=title,
+                    bucket=bucket,
+                    playlist_id=playlist_id,
+                    duration_seconds=duration_i,
+                    channel_id=str(info.get("channel_id") or ""),
+                    channel_handle=str(info.get("channel_handle") or ""),
+                    url=str(info.get("url") or watch_url(video_id)),
+                    upload_date=str(info.get("upload_date") or ""),
+                )
+            )
     return selected, skipped
 
 
@@ -422,6 +511,10 @@ def _refused_from_args(args: argparse.Namespace) -> list[str]:
             reasons.append(f"{flag}={value} exceeds the V1 cap of {cap}")
         elif value < 0:
             reasons.append(f"{flag}={value} must not be negative")
+    if getattr(args, "max_new", 0) < 0:
+        reasons.append(f"--max-new={args.max_new} must not be negative")
+    if getattr(args, "feed", False) and args.video_id:
+        reasons.append("--feed and --video-id are mutually exclusive")
     if len(args.video_id) > V1_TOTAL_CAP:
         reasons.append(
             f"--video-id given {len(args.video_id)} times, over the V1 total cap of {V1_TOTAL_CAP}"
@@ -461,6 +554,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--appearances-limit", type=int, default=V1_APPEARANCES)
     p.add_argument("--branding-limit", type=int, default=V1_BRANDING)
     p.add_argument("--shorts-limit", type=int, default=V1_SHORTS)
+    p.add_argument(
+        "--feed",
+        action="store_true",
+        help=(
+            "Follow the whole @future_of_education Videos tab plus the Appearances and "
+            "About Gifted Minds playlists; ingest new uploads that are not podcast duplicates."
+        ),
+    )
+    p.add_argument(
+        "--max-new",
+        type=int,
+        default=FEED_MAX_NEW_DEFAULT,
+        help=f"With --feed: most new videos to ingest per run (default {FEED_MAX_NEW_DEFAULT}).",
+    )
     p.add_argument(
         "--video-id",
         action="append",
@@ -549,6 +656,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     url=str(info.get("url") or watch_url(vid)),
                 )
             )
+    elif args.feed:
+        print(f"Walking the channel feed (max {args.max_new} new videos)...")
+        candidates, skipped = select_feed_candidates(
+            rss_entries=rss_entries,
+            episodes_ids=episodes_ids,
+            max_new=args.max_new,
+        )
     else:
         print("Selecting V1 candidates...")
         candidates, skipped = select_v1_candidates(
@@ -579,14 +693,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         },
         "titles": {c.video_id: c.title for c in candidates},
     }
-    print(f"V1 cap: {json.dumps(v1_cap['counts'], indent=2)}")
+    print(f"{'Feed' if args.feed else 'V1 cap'}: {json.dumps(v1_cap['counts'], indent=2)}")
     for c in candidates:
         print(f"  [{c.bucket}] {c.video_id}  {c.title}")
 
-    write_skip_log(skipped, extra={"v1_cap": v1_cap, "skip_proof": asdict(proof) if proof else None})
-    (YOUTUBE_METADATA_DIR / "_v1_cap.json").write_text(
-        json.dumps(v1_cap, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    write_skip_log(
+        skipped,
+        extra={
+            "mode": "feed" if args.feed else "v1",
+            "v1_cap": v1_cap,
+            "skip_proof": asdict(proof) if proof else None,
+        },
     )
+    if not args.feed:
+        (YOUTUBE_METADATA_DIR / "_v1_cap.json").write_text(
+            json.dumps(v1_cap, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
 
     if args.dry_run:
         print("Dry run: no downloads / no Chroma writes.")

@@ -1,8 +1,8 @@
 # Daily ingest (TASK-19)
 
-One Cloud Run **Job** (not the public MCP service) walks Art19 RSS, Substack, and unique YouTube every day. Failures are isolated per source. A run ledger is written every time. After ingest, derived artifacts + `chroma_db/` are checksum-synced to `gs://learningfocused-corpus`, then `learningfocused-mcp` is rolled so warm instances rehydrate.
+One Cloud Run **Job** (not the public MCP service) checks every feed in [`src/feeds/sources.json`](feeds.md) that is due: Art19 RSS, Substack and the whole `@future_of_education` YouTube channel daily, social accounts once configured. Failures are isolated per source. A run ledger is written every time. After ingest, derived artifacts + `chroma_db/` are checksum-synced to `gs://learningfocused-corpus`, then `learningfocused-mcp` is rolled so warm instances rehydrate.
 
-Does **not** `--reset-chroma`, re-transcribe existing files, raise the YouTube V1 cap, ingest `@thealphaschool` / UU dumps / Shorts-tab dumps, wipe Neo4j, or scale the MCP service to zero. Graph/Neo4j is skipped in the job (no Docker/Aura on Cloud Run).
+Does **not** `--reset-chroma`, re-transcribe existing files, take more than `max_new_per_run` new YouTube videos per run, ingest `@thealphaschool` / UU dumps / Shorts-tab dumps, wipe Neo4j, or scale the MCP service to zero. Graph/Neo4j is skipped in the job (no Docker/Aura on Cloud Run).
 
 Project is LearningFocus (`gen-lang-client-0304733057`, same as `.env` `GCP_PROJECT_ID`) / `us-west1`. Do not deploy to `inferpoker`; that project belongs to InferPoker.
 
@@ -18,15 +18,20 @@ uv run python -m src.pipeline.daily_ingest
 | `--skip-hydrate` | Do not pull chroma/artifacts from GCS (laptop with a local corpus) |
 | `--skip-sync` | Do not upload artifacts/chroma |
 | `--skip-roll` | Do not roll `learningfocused-mcp` |
-| `--skip-art19` / `--skip-substack` / `--skip-youtube` | Drop a source |
+| `--source KEY` | Run only this registry key, due or not (repeatable) |
+| `--skip KEY` | Skip a registry key (repeatable) |
+| `--skip-art19` / `--skip-substack` / `--skip-youtube` | Shorthands for `--skip` |
 
 Isolation: each source is wrapped in `try/except`. Art19 raising does not skip Substack or YouTube. The process still writes the ledger and attempts GCS sync + MCP roll.
 
-Wrapped runners (Neo4j always skipped; `--force` off; `--reset-chroma` off):
+Wrapped runners (Neo4j always skipped; `--force` off; `--reset-chroma` off). Limits come from each source's `config` in `sources.json`; a bad value fails only that source.
 
-- Art19: `python -m src.pipeline.audio.run --skip-neo4j -- --mode daily --download-limit 5`
-- Substack: `python -m src.pipeline.substack.run --skip-neo4j -- --mode daily --ingest-limit 10`
-- YouTube: `python -m src.pipeline.youtube.run` (existing `skip.py` + V1 cap)
+- `podcast_rss` (Art19): `python -m src.pipeline.audio.run --skip-neo4j -- --mode daily --download-limit <download_limit>` (`DAILY_ART19_DOWNLOAD_LIMIT` env overrides)
+- `substack`: `python -m src.pipeline.substack.run --skip-neo4j -- --mode daily --ingest-limit <ingest_limit>`
+- `youtube_channel`: `python -m src.pipeline.youtube.run --feed --max-new <max_new_per_run>` (videos tab + the two playlists, deduplicated against podcast episodes by `skip.py`)
+- `instagram` / `x` / `linkedin` / `tiktok`: `src/feeds/social.py` (skipped until accounts and a credential are set)
+
+If `sources.json` can't be parsed, the job logs the error and runs the three core feeds anyway.
 
 Audio download skips an MP3 when the matching transcript already exists, so the job can hydrate transcripts (~9 MiB) instead of `podcast_downloads/` (~6 GiB). A **new** RSS episode has no transcript, so it is downloaded and sent to AssemblyAI.
 
@@ -38,7 +43,9 @@ Every run writes:
 - `gs://learningfocused-corpus/ingest_ledger/<run_id>.json`
 - `gs://learningfocused-corpus/ingest_ledger/latest.json`
 
-Fields: `started_at` / `finished_at`, per-source `ok` / `error`, hydrate counts, GCS upload stats, MCP revision after roll.
+Fields: `started_at` / `finished_at`, per-source `ok` / `error`, hydrate counts, GCS upload stats, MCP revision after roll, `pg_state`.
+
+With `PG_DSN` set, the run also mirrors `sources.json` into the `sources` table, reads each source's last check (for weekly cadence), and writes `ingest_runs` + `source_checks`. Any Postgres error is recorded under `pg_state` and never fails the run. Until the job is given `PG_DSN` (with the MCP Postgres switch), weekly sources run on Mondays.
 
 ## Cloud Run Job
 
