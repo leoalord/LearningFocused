@@ -35,7 +35,9 @@ Approximate cost: e2-small ~$12–13/month, disk + snapshots ~$2–3/month, no e
 # Passwords go through libpq's PGPASSWORD, so they never appear in the command line or history.
 gcloud compute start-iap-tunnel learningfocused-pg 5432 --local-host-port=localhost:6543 \
   --zone=us-west1-b --project=gen-lang-client-0304733057 &
-# If the IAP tunnel hangs on "Testing if tunnel connection works", forward the port over IAP SSH instead:
+# If the IAP tunnel hangs on "Testing if tunnel connection works", stop it (kill %1) so it frees
+# port 6543, then forward the port over IAP SSH instead (run it once in the foreground first if
+# gcloud still needs to create an SSH key):
 #   gcloud compute ssh learningfocused-pg --zone=us-west1-b --project=gen-lang-client-0304733057 \
 #     --tunnel-through-iap -- -N -L 6543:localhost:5432 &
 export PGPASSWORD="$(gcloud secrets versions access latest --secret=learningfocused-pg-password --project=gen-lang-client-0304733057)"

@@ -88,20 +88,16 @@ gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" \
   --member="serviceAccount:${SA_EMAIL}" --role="roles/storage.objectCreator" --project="${PROJECT}" \
   --condition=None >/dev/null
 # `gcloud storage cp` resolves the destination with an objects.get and then an objects.list on
-# the dump's name, so the VM needs both, limited to pg_dumps/ so it can't read the corpus.
-# objects.list is checked against the bucket, so it is matched on the list prefix instead.
-# The expression has a comma, which --condition can't parse, hence the file.
-PG_DUMPS_CONDITION="$(mktemp)"
-cat > "${PG_DUMPS_CONDITION}" <<EOF
-title: pg-dumps-read
-expression: >-
-  resource.name.startsWith("projects/_/buckets/${BUCKET}/objects/pg_dumps/") ||
-  api.getAttribute("storage.googleapis.com/objectListPrefix", "").startsWith("pg_dumps/")
-EOF
+# the dump's name. Reads are limited to pg_dumps/ so the VM can't read the corpus. Listing is
+# checked against the bucket and Cloud Storage role conditions can't match a list prefix, so
+# the VM gets legacyBucketReader: it can see object names, not their contents.
 gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" \
   --member="serviceAccount:${SA_EMAIL}" --role="roles/storage.objectViewer" --project="${PROJECT}" \
-  --condition-from-file="${PG_DUMPS_CONDITION}" >/dev/null
-rm -f "${PG_DUMPS_CONDITION}"
+  --condition="expression=resource.name.startsWith(\"projects/_/buckets/${BUCKET}/objects/pg_dumps/\"),title=pg-dumps-read" \
+  >/dev/null
+gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" \
+  --member="serviceAccount:${SA_EMAIL}" --role="roles/storage.legacyBucketReader" --project="${PROJECT}" \
+  --condition=None >/dev/null
 if [[ -z "$(gcloud storage buckets describe "gs://${BUCKET}" --project="${PROJECT}" --format='value(lifecycle_config)')" ]]; then
   echo ">> Bucket lifecycle: delete pg_dumps/ objects after 30 days"
   LIFECYCLE="$(mktemp)"
