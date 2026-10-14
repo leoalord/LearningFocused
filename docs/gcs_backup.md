@@ -22,7 +22,11 @@ Everything for LearningFocused lives in the LearningFocus project (`gen-lang-cli
 ./scripts/deploy_ingest_job.sh          # new daily job + scheduler in LearningFocus
 ```
 
-The script only copies; it never deletes anything in `inferpoker`. It prints the cleanup commands to run once the new setup is verified.
+The script pauses the old daily scheduler (reversible) so the two buckets can't drift, then only copies; it never deletes anything in `inferpoker`. It prints the cleanup commands to run once the new setup is verified.
+
+Before running it, remove any `GCP_BACKUP_PROJECT=inferpoker`, `GCS_CORPUS_BUCKET=inferpoker-learningfocused` or `GCS_CHROMA_BUCKET=inferpoker-learningfocused` from your shell and `.env`. The scripts refuse those values (`scripts/_gcp_env.sh`); the Python code prefers `GCS_CHROMA_BUCKET` over `GCS_CORPUS_BUCKET`, so a stale value there would win silently.
+
+`deploy_mcp.sh` builds with `--source`, which runs as the project's default compute service account. In a new project that account may lack the roles it needs (if the org disables automatic IAM grants); if the build fails with a permission error, grant it `roles/cloudbuild.builds.builder`.
 
 ## Prefixes (local dir name = object prefix)
 
