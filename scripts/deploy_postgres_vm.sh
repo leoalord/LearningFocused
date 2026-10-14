@@ -82,14 +82,26 @@ gcloud artifacts repositories add-iam-policy-binding "${AR_REPO}" --location="${
   --member="serviceAccount:${SA_EMAIL}" --role="roles/artifactregistry.reader" --project="${PROJECT}" >/dev/null
 gcloud secrets add-iam-policy-binding "${SECRET_PASSWORD}" \
   --member="serviceAccount:${SA_EMAIL}" --role="roles/secretmanager.secretAccessor" --project="${PROJECT}" >/dev/null
+# --condition=None on every bucket binding: once the policy holds a conditional binding,
+# gcloud refuses (or prompts for) unconditional adds.
 gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" \
-  --member="serviceAccount:${SA_EMAIL}" --role="roles/storage.objectCreator" --project="${PROJECT}" >/dev/null
-# `gcloud storage cp` checks for an existing object before uploading, and restore-test downloads
-# the newest dump, so the VM also needs read access, limited to pg_dumps/ so it can't read the corpus.
+  --member="serviceAccount:${SA_EMAIL}" --role="roles/storage.objectCreator" --project="${PROJECT}" \
+  --condition=None >/dev/null
+# `gcloud storage cp` resolves the destination with an objects.get and then an objects.list on
+# the dump's name, so the VM needs both, limited to pg_dumps/ so it can't read the corpus.
+# objects.list is checked against the bucket, so it is matched on the list prefix instead.
+# The expression has a comma, which --condition can't parse, hence the file.
+PG_DUMPS_CONDITION="$(mktemp)"
+cat > "${PG_DUMPS_CONDITION}" <<EOF
+title: pg-dumps-read
+expression: >-
+  resource.name.startsWith("projects/_/buckets/${BUCKET}/objects/pg_dumps/") ||
+  api.getAttribute("storage.googleapis.com/objectListPrefix", "").startsWith("pg_dumps/")
+EOF
 gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" \
   --member="serviceAccount:${SA_EMAIL}" --role="roles/storage.objectViewer" --project="${PROJECT}" \
-  --condition="expression=resource.name.startsWith(\"projects/_/buckets/${BUCKET}/objects/pg_dumps/\"),title=pg-dumps-read" \
-  >/dev/null
+  --condition-from-file="${PG_DUMPS_CONDITION}" >/dev/null
+rm -f "${PG_DUMPS_CONDITION}"
 if [[ -z "$(gcloud storage buckets describe "gs://${BUCKET}" --project="${PROJECT}" --format='value(lifecycle_config)')" ]]; then
   echo ">> Bucket lifecycle: delete pg_dumps/ objects after 30 days"
   LIFECYCLE="$(mktemp)"

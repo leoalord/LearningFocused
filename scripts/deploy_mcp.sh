@@ -100,6 +100,7 @@ echo ">> Granting ${SA_EMAIL} objectViewer on gs://${BUCKET}"
 gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" \
   --member="serviceAccount:${SA_EMAIL}" \
   --role="roles/storage.objectViewer" \
+  --condition=None \
   --project="${PROJECT}" >/dev/null
 
 read_env_value() {
