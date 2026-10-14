@@ -56,8 +56,16 @@ if ! pause_out="$(gcloud scheduler jobs pause learningfocused-ingest-daily \
     exit 1
   fi
 fi
-running="$(gcloud run jobs executions list --job=learningfocused-ingest --region="${REGION}" \
-  --project="${OLD_PROJECT}" --filter='NOT status.completionTime:*' --format='value(name)' 2>/dev/null || true)"
+if ! running="$(gcloud run jobs executions list --job=learningfocused-ingest --region="${REGION}" \
+    --project="${OLD_PROJECT}" --filter='NOT status.completionTime:*' --format='value(name)' 2>&1)"; then
+  if grep -qiE 'NOT_FOUND|not found' <<<"${running}"; then
+    running=""
+  else
+    echo "${running}" >&2
+    echo "Could not check for running old ingest executions; not copying." >&2
+    exit 1
+  fi
+fi
 if [[ -n "${running}" ]]; then
   echo "An old ingest run is still in progress (${running}). Wait for it to finish, then re-run." >&2
   exit 1
