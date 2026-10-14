@@ -46,8 +46,22 @@ fi
 # the two corpora don't drift (or pay AssemblyAI twice). Pausing is reversible:
 #   gcloud scheduler jobs resume learningfocused-ingest-daily --location=${REGION} --project=${OLD_PROJECT}
 echo ">> Pausing the old daily scheduler in ${OLD_PROJECT}"
-gcloud scheduler jobs pause learningfocused-ingest-daily --location="${REGION}" --project="${OLD_PROJECT}" \
-  || echo "   (not found or already paused)"
+if ! pause_out="$(gcloud scheduler jobs pause learningfocused-ingest-daily \
+    --location="${REGION}" --project="${OLD_PROJECT}" 2>&1)"; then
+  if grep -qiE 'NOT_FOUND|not found' <<<"${pause_out}"; then
+    echo "   (no old scheduler job)"
+  else
+    echo "${pause_out}" >&2
+    echo "Could not pause the old scheduler; not copying while it may still write." >&2
+    exit 1
+  fi
+fi
+running="$(gcloud run jobs executions list --job=learningfocused-ingest --region="${REGION}" \
+  --project="${OLD_PROJECT}" --filter='NOT status.completionTime:*' --format='value(name)' 2>/dev/null || true)"
+if [[ -n "${running}" ]]; then
+  echo "An old ingest run is still in progress (${running}). Wait for it to finish, then re-run." >&2
+  exit 1
+fi
 
 # --project only sets the billing/quota project; reading the old bucket uses your own
 # access to ${OLD_PROJECT}.
@@ -55,14 +69,18 @@ echo ">> Copying gs://${OLD_BUCKET} -> gs://${BUCKET} (checksum rsync, includes 
 gcloud storage rsync "gs://${OLD_BUCKET}" "gs://${BUCKET}" \
   --recursive --checksums-only --project="${PROJECT}"
 
-count_objects() {
-  gcloud storage ls -r "gs://$1/**" --project="${PROJECT}" | grep -vc '/$' || true
+# Verify: a second checksum rsync in dry-run mode must find nothing left to copy. This
+# checks every source object's name and checksum, not just counts.
+echo ">> Verifying every object in gs://${OLD_BUCKET} is in gs://${BUCKET} with the same checksum"
+pending="$(gcloud storage rsync "gs://${OLD_BUCKET}" "gs://${BUCKET}" \
+  --recursive --checksums-only --dry-run --project="${PROJECT}" 2>&1)" || {
+  echo "${pending}" >&2
+  echo "Verification could not run; do not retire anything in ${OLD_PROJECT}." >&2
+  exit 1
 }
-old_count="$(count_objects "${OLD_BUCKET}")"
-new_count="$(count_objects "${BUCKET}")"
-echo ">> Objects: gs://${OLD_BUCKET}=${old_count} gs://${BUCKET}=${new_count}"
-if (( new_count < old_count )); then
-  echo "The copy is missing objects. Re-run this script; do not retire anything in ${OLD_PROJECT}." >&2
+if grep -qi 'would copy' <<<"${pending}"; then
+  grep -i 'would copy' <<<"${pending}" | head -20 >&2
+  echo "The copy is incomplete. Re-run this script; do not retire anything in ${OLD_PROJECT}." >&2
   exit 1
 fi
 
