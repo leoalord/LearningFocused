@@ -7,12 +7,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
 
-PROJECT="${GCP_BACKUP_PROJECT:-gen-lang-client-0304733057}"
-REGION="${GCP_REGION:-us-west1}"
+source "$(dirname "${BASH_SOURCE[0]}")/_gcp_env.sh"
 SERVICE="${CLOUD_RUN_SERVICE:-learningfocused-mcp}"
 SA_NAME="${CLOUD_RUN_SA:-learningfocused-mcp}"
 SA_EMAIL="${SA_NAME}@${PROJECT}.iam.gserviceaccount.com"
-BUCKET="${GCS_CORPUS_BUCKET:-learningfocused-corpus}"
 AR_REPO="${AR_REPO:-learningfocused}"
 SECRET_OPENAI="${SECRET_OPENAI:-learningfocused-openai-api-key}"
 SECRET_GOOGLE="${SECRET_GOOGLE:-learningfocused-google-api-key}"
