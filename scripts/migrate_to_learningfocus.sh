@@ -59,20 +59,19 @@ fi
 # Only stdout lists running executions; gcloud's notices (e.g. "WARNING: ... 0 items")
 # go to stderr and must not be read as a running job.
 exec_err="$(mktemp)"
+trap 'rm -f "${exec_err}"' EXIT
 if ! running="$(gcloud run jobs executions list --job=learningfocused-ingest --region="${REGION}" \
     --project="${OLD_PROJECT}" --filter='NOT status.completionTime:*' --format='value(name)' 2>"${exec_err}")"; then
   if grep -qiE 'NOT_FOUND|not found' "${exec_err}"; then
     running=""
   else
     cat "${exec_err}" >&2
-    rm -f "${exec_err}"
     echo "Could not check for running old ingest executions; not copying." >&2
     exit 1
   fi
 fi
-rm -f "${exec_err}"
 if [[ -n "${running}" ]]; then
-  echo "An old ingest run is still in progress (${running}). Wait for it to finish, then re-run." >&2
+  echo "An old ingest run is still in progress (${running//$'\n'/, }). Wait for it to finish, then re-run." >&2
   exit 1
 fi
 
