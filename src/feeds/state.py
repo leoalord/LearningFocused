@@ -30,12 +30,12 @@ def sync_registry(sources: list[SourceConfig], *, dsn: str | None = None) -> int
             row = s.as_row()
             conn.execute(
                 """
-                INSERT INTO sources (key, kind, name, url, cadence, enabled, config, updated_at)
-                VALUES (%(key)s, %(kind)s, %(name)s, %(url)s, %(cadence)s, %(enabled)s, %(config)s::jsonb, now())
+                INSERT INTO sources (key, kind, name, url, cadence, enabled, config)
+                VALUES (%(key)s, %(kind)s, %(name)s, %(url)s, %(cadence)s, %(enabled)s, %(config)s::jsonb)
                 ON CONFLICT (key) DO UPDATE SET
                     kind = EXCLUDED.kind, name = EXCLUDED.name, url = EXCLUDED.url,
                     cadence = EXCLUDED.cadence, enabled = EXCLUDED.enabled,
-                    config = EXCLUDED.config, updated_at = now()
+                    config = EXCLUDED.config
                 """,
                 {**row, "config": json.dumps(row["config"])},
             )
@@ -92,6 +92,14 @@ def record_run(ledger: dict[str, Any], *, dsn: str | None = None) -> bool:
                 (run_id, key, result.get("ok"), skipped, result.get("error"), json.dumps(json_safe(result))),
             )
             if result.get("dry_run"):
+                continue
+            if result.get("skipped") and not result.get("ok"):
+                # Never ran (e.g. hydrate failed): keep it due, so a weekly source isn't
+                # pushed back a week by an unrelated failure.
+                continue
+            if skipped:
+                # Checked but nothing to fetch (no accounts/credential): not a success.
+                conn.execute("UPDATE sources SET last_checked_at = now() WHERE key = %s", (key,))
                 continue
             conn.execute(
                 """

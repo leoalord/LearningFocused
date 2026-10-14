@@ -53,6 +53,28 @@ class TestSelectFeedCandidates(unittest.TestCase):
         selected, _ = self.select(max_new=2)
         self.assertEqual([c.video_id for c in selected], ["app00000001", "new00000001"])
 
+    def test_given_up_videos_are_excluded(self) -> None:
+        with patch("src.pipeline.youtube.run._flat_items", side_effect=fake_flat):
+            selected, _ = select_feed_candidates(
+                rss_entries=RSS, episodes_ids=set(), listings=LISTINGS,
+                already_ingested=lambda vid: False, exclude={"new00000001"},
+            )
+        self.assertNotIn("new00000001", [c.video_id for c in selected])
+
+    def test_failure_ledger_counts_and_clears(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        from src.pipeline.youtube import run as yt
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(yt, "FEED_FAILURES_PATH", Path(tmp) / "_feed_failures.json"):
+                for _ in range(yt.FEED_MAX_ATTEMPTS):
+                    yt.update_feed_failures(ingested=[], failed=[{"video_id": "bad", "error": "no captions"}])
+                self.assertEqual(yt.given_up_video_ids(), {"bad"})
+                yt.update_feed_failures(ingested=["bad"], failed=[])
+                self.assertEqual(yt.given_up_video_ids(), set())
+
     def test_cli_flags(self) -> None:
         args = build_parser().parse_args(["--feed", "--max-new", "3"])
         self.assertTrue(args.feed)

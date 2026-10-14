@@ -1,5 +1,5 @@
 {
-  "_comment": "Every feed the daily job checks. Edit here (or the Postgres `sources` table, seeded from this file). cadence: daily | weekly | manual. Social sources stay disabled until accounts and credentials are filled in.",
+  "_comment": "Every feed the daily job checks. Edit only this file; the Postgres `sources` table is a mirror that each run overwrites. cadence: daily | weekly | manual. The YouTube entry walks the @future_of_education Videos tab plus the 'MacKenzie Price Media Appearances' and 'About Gifted Minds' playlists (fixed in src/pipeline/youtube/run.py feed_listings). Social sources stay disabled until accounts and credentials are filled in.",
   "sources": [
     {
       "key": "art19",
@@ -26,12 +26,7 @@
       "url": "https://www.youtube.com/@future_of_education/videos",
       "cadence": "daily",
       "enabled": true,
-      "config": {
-        "channel_id": "UCKHZkY1J1NyKypLn80Pj19A",
-        "mode": "feed",
-        "max_new_per_run": 10,
-        "playlists": ["MacKenzie Price Media Appearances", "About Gifted Minds"]
-      }
+      "config": {"max_new_per_run": 10}
     },
     {
       "key": "instagram",

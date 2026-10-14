@@ -15,7 +15,7 @@ import sys
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from dotenv import load_dotenv
 
@@ -254,6 +254,38 @@ def select_v1_candidates(
 
 
 FEED_MAX_NEW_DEFAULT = 10
+# A video that fails this many feed runs in a row stops being retried (and stops taking
+# a slot from the backlog). Delete its entry in _feed_failures.json to retry it.
+FEED_MAX_ATTEMPTS = 3
+FEED_FAILURES_PATH = YOUTUBE_METADATA_DIR / "_feed_failures.json"
+
+
+def load_feed_failures() -> dict[str, dict[str, Any]]:
+    """{video_id: {attempts, last_error, last_attempt_at}}; synced with youtube_videos/ in GCS."""
+    try:
+        data = json.loads(FEED_FAILURES_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def update_feed_failures(*, ingested: list[str], failed: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    failures = load_feed_failures()
+    for video_id in ingested:
+        failures.pop(video_id, None)
+    now = datetime.now(timezone.utc).isoformat()
+    for item in failed:
+        entry = failures.setdefault(item["video_id"], {"attempts": 0})
+        entry["attempts"] = int(entry.get("attempts") or 0) + 1
+        entry["last_error"] = str(item.get("error") or "")[:500]
+        entry["last_attempt_at"] = now
+    FEED_FAILURES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    FEED_FAILURES_PATH.write_text(json.dumps(failures, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return failures
+
+
+def given_up_video_ids() -> set[str]:
+    return {vid for vid, e in load_feed_failures().items() if int(e.get("attempts") or 0) >= FEED_MAX_ATTEMPTS}
 
 
 def _already_ingested(video_id: str) -> bool:
@@ -284,18 +316,20 @@ def select_feed_candidates(
     episodes_ids: set[str],
     max_new: int = FEED_MAX_NEW_DEFAULT,
     listings: list[tuple[str, str, str | None, bool]] | None = None,
-    already_ingested: Any = None,
+    already_ingested: Callable[[str], bool] | None = None,
+    exclude: set[str] | None = None,
 ) -> tuple[list[Candidate], list[SkipDecision]]:
     """Every channel upload not yet ingested and not a podcast duplicate, up to max_new.
 
     Podcast twins are skipped with the same rules as V1 (title match, same recording,
     Gifted Minds Episodes playlist, RSS intro twins), so a transcript is never stored
-    twice. Already-ingested videos are passed over without counting toward max_new.
+    twice. Already-ingested videos, and `exclude` (videos that kept failing), are
+    passed over without counting toward max_new.
     """
     is_done = already_ingested or _already_ingested
     selected: list[Candidate] = []
     skipped: list[SkipDecision] = []
-    seen: set[str] = set()
+    seen: set[str] = set(exclude or ())
     for url, bucket, playlist_id, allow_same_recording in listings or feed_listings():
         if len(selected) >= max_new:
             break
@@ -306,11 +340,14 @@ def select_feed_candidates(
             if not video_id or video_id in seen:
                 continue
             seen.add(video_id)
-            if video_id == SKIP_PROOF_VIDEO_ID or is_done(video_id):
+            if is_done(video_id):
                 continue
             title = str(info.get("title") or "")
             duration = info.get("duration_seconds")
-            duration_i = int(duration) if isinstance(duration, (int, float)) else None
+            try:
+                duration_i = int(duration) if duration is not None else None
+            except (TypeError, ValueError):
+                duration_i = None
             decision = skip_decision(
                 video_id=video_id,
                 title=title,
@@ -657,11 +694,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             )
     elif args.feed:
-        print(f"Walking the channel feed (max {args.max_new} new videos)...")
+        given_up = given_up_video_ids()
+        print(f"Walking the channel feed (max {args.max_new} new videos; "
+              f"{len(given_up)} given up after {FEED_MAX_ATTEMPTS} failures)...")
         candidates, skipped = select_feed_candidates(
             rss_entries=rss_entries,
             episodes_ids=episodes_ids,
             max_new=args.max_new,
+            exclude=given_up,
         )
     else:
         print("Selecting V1 candidates...")
@@ -726,6 +766,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             result.failed.append({"video_id": cand.video_id, "error": str(exc)})
 
     print(f"\nIngested {len(result.ingested)} / {len(candidates)} (failed {len(result.failed)})")
+    if args.feed:
+        update_feed_failures(ingested=result.ingested, failed=result.failed)
     if not args.skip_chroma:
         print("\n=== CHROMA UPSERT (youtube_* only; no reset, no audio/Substack) ===")
         index_youtube_only(prune_stale=args.prune_stale_chroma)

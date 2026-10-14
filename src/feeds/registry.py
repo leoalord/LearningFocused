@@ -1,7 +1,8 @@
 """Load the feed registry and decide which sources are due today.
 
-`sources.json` is the source of truth; when Postgres is configured the daily job
-mirrors it into the `sources` table and reads back last-check times from there.
+`sources.json` is the only place to edit sources. When Postgres is configured the daily
+job mirrors it into the `sources` table (overwriting any edits there) and reads back
+last-check times from there.
 """
 
 from __future__ import annotations
@@ -67,17 +68,24 @@ def load_sources(path: Path | None = None) -> list[SourceConfig]:
     return sources
 
 
-def is_due(source: SourceConfig, *, now: datetime, last_checked_at: datetime | None) -> bool:
+def is_due(
+    source: SourceConfig,
+    *,
+    now: datetime,
+    last_checked_at: datetime | None,
+    has_state: bool = False,
+) -> bool:
     """Daily: always. Manual: never. Weekly: ~7 days since the last check.
 
-    Without a last-check time (no Postgres state yet), weekly sources run on Mondays.
+    `has_state` means last-check times were read from Postgres: a weekly source with no
+    check yet is then due now. Without state at all, weekly sources run on Mondays.
     """
     if not source.enabled or source.cadence == "manual":
         return False
     if source.cadence == "daily":
         return True
     if last_checked_at is None:
-        return now.weekday() == 0
+        return has_state or now.weekday() == 0
     return now - last_checked_at >= WEEKLY_INTERVAL
 
 
@@ -87,5 +95,9 @@ def due_sources(
     now: datetime,
     last_checked: dict[str, datetime] | None = None,
 ) -> list[SourceConfig]:
+    """`last_checked=None` means no Postgres state; `{}` means state with no checks yet."""
     last = last_checked or {}
-    return [s for s in sources if is_due(s, now=now, last_checked_at=last.get(s.key))]
+    return [
+        s for s in sources
+        if is_due(s, now=now, last_checked_at=last.get(s.key), has_state=last_checked is not None)
+    ]

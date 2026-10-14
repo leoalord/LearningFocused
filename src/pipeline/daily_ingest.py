@@ -25,6 +25,7 @@ from typing import Any, Callable, Sequence
 from dotenv import load_dotenv
 
 from src.config import LEDGER_DIR, RSS_FEED_URL, SUBSTACK_FEED_URL, ensure_data_dirs
+from src.pipeline.youtube.constants import VIDEOS_TAB_URL as YOUTUBE_FEED_URL
 from src.feeds import state as feed_state
 from src.feeds.registry import SOCIAL_KINDS, SourceConfig, due_sources, load_sources
 from src.gcs_corpus import (
@@ -84,16 +85,20 @@ def run_substack(ingest_limit: int = DEFAULT_SUBSTACK_INGEST_LIMIT) -> dict[str,
 
 
 def run_youtube(max_new: int = DEFAULT_YOUTUBE_MAX_NEW) -> dict[str, Any]:
-    """Whole-channel YouTube feed (videos tab + listed playlists) with skip.py dedupe.
+    """Whole-channel YouTube feed (videos tab + two playlists) with skip.py dedupe.
 
-    No --force. No --reset-chroma. At most `max_new` new videos per run.
+    No --force. No --reset-chroma. At most `max_new` new videos per run. Any video that
+    fails marks this source failed (it is retried on later runs, up to youtube.run's
+    FEED_MAX_ATTEMPTS), so failures show up in the ledger and in source_checks.
     """
     from src.pipeline.youtube.run import main as youtube_main
 
     argv = ["--feed", "--max-new", str(max_new)]
     print(f"\n=== SOURCE youtube ===\npython -m src.pipeline.youtube.run {' '.join(argv)}")
     code = youtube_main(argv)
-    if code not in (0, 1):
+    if code == 1:
+        raise RuntimeError("youtube.run: one or more videos failed (see the FAILED lines above)")
+    if code != 0:
         raise RuntimeError(f"youtube.run exited {code} (refused or unexpected)")
     return {"argv": argv, "exit_code": code}
 
@@ -102,7 +107,7 @@ def run_youtube(max_new: int = DEFAULT_YOUTUBE_MAX_NEW) -> dict[str, Any]:
 FALLBACK_REGISTRY = [
     SourceConfig(key=SOURCE_ART19, kind="podcast_rss", name="Art19", url=RSS_FEED_URL),
     SourceConfig(key=SOURCE_SUBSTACK, kind="substack", name="Substack", url=SUBSTACK_FEED_URL),
-    SourceConfig(key=SOURCE_YOUTUBE, kind="youtube_channel", name="YouTube"),
+    SourceConfig(key=SOURCE_YOUTUBE, kind="youtube_channel", name="YouTube", url=YOUTUBE_FEED_URL),
 ]
 
 
@@ -134,6 +139,8 @@ def runner_for(source: SourceConfig) -> SourceRunner:
             _require_builtin_url(source, SUBSTACK_FEED_URL)
             return run_substack(_int_config(source, "ingest_limit", DEFAULT_SUBSTACK_INGEST_LIMIT))
         if source.kind == "youtube_channel":
+            # The channel and its two playlists are fixed in youtube.run.feed_listings().
+            _require_builtin_url(source, YOUTUBE_FEED_URL)
             return run_youtube(_int_config(source, "max_new_per_run", DEFAULT_YOUTUBE_MAX_NEW))
         if source.kind in SOCIAL_KINDS:
             from src.feeds.social import run_social
@@ -157,13 +164,14 @@ def _pg_step(ledger: dict[str, Any], name: str, fn: Callable[[], Any]) -> Any:
     return result
 
 
-def _load_registry(ledger: dict[str, Any]) -> list[SourceConfig]:
+def _load_registry(ledger: dict[str, Any]) -> tuple[list[SourceConfig], bool]:
+    """(sources, is_fallback)."""
     try:
-        return load_sources()
+        return load_sources(), False
     except Exception as exc:  # noqa: BLE001
         ledger["errors"].append(f"registry: {type(exc).__name__}: {exc}")
         print(f"WARNING: could not read sources.json, using the built-in feeds: {exc}")
-        return list(FALLBACK_REGISTRY)
+        return list(FALLBACK_REGISTRY), True
 
 
 def _write_ledger_local(payload: dict[str, Any], run_id: str) -> Path:
@@ -384,17 +392,21 @@ def run(
         "errors": [],
     }
 
+    fallback = False
     if registry is None:
-        registry = _load_registry(ledger)
+        registry, fallback = _load_registry(ledger)
     by_key = {s.key: s for s in registry}
     if sources is None:
-        last_checked: dict[str, datetime] = {}
+        last_checked: dict[str, datetime] | None = None
         if use_pg:
-            _pg_step(ledger, "sync_registry", lambda: feed_state.sync_registry(registry or []))
-            last_checked = _pg_step(ledger, "last_checked", feed_state.last_checked) or {}
+            # Never mirror the fallback list: it would overwrite good rows with bare defaults.
+            if not fallback:
+                _pg_step(ledger, "sync_registry", lambda: feed_state.sync_registry(registry or []))
+            last_checked = _pg_step(ledger, "last_checked", feed_state.last_checked)
         due = due_sources(registry, now=started, last_checked=last_checked)
         sources = [s.key for s in due]
-    wanted = tuple(name for name in sources if name not in set(skip))
+    skipped_keys = set(skip)
+    wanted = tuple(name for name in dict.fromkeys(sources) if name not in skipped_keys)
     runners: dict[str, SourceRunner] = (
         dict(source_runners) if source_runners is not None
         else {key: runner_for(src) for key, src in by_key.items()}

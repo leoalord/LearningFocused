@@ -1,6 +1,6 @@
 # Feeds the daily job checks
 
-`src/feeds/sources.json` is the list. Each entry has a `key`, a `kind`, a `cadence` (`daily`, `weekly` or `manual`), `enabled`, and a `config` for that kind. With Postgres configured it is mirrored into the `sources` table, which also keeps each source's last check, last success and last error.
+`src/feeds/sources.json` is the list, and the only place to edit it. Each entry has a `key`, a `kind`, a `cadence` (`daily`, `weekly` or `manual`), `enabled`, and a `config` for that kind. With Postgres configured, each run mirrors it into the `sources` table (overwriting edits there), which also keeps each source's last check, last success and last error.
 
 | Key | Kind | What | Cadence |
 | --- | --- | --- | --- |
@@ -10,7 +10,7 @@
 | `instagram` | `instagram` | Off until `accounts` and `INSTAGRAM_ACCESS_TOKEN` are set | daily |
 | `x`, `linkedin`, `tiktok` | same | Off until accounts and credentials are set | weekly |
 
-Weekly sources run when 6.5 days have passed since their last check (or on Mondays when there is no Postgres state).
+Weekly sources run when 6.5 days have passed since their last check, or on their first run once Postgres is connected (on Mondays without Postgres). A run that never reached a source (for example, when the GCS hydrate failed) does not count as a check.
 
 ## Turning on a social source
 
@@ -23,3 +23,7 @@ Instagram's Graph API only reads accounts you own or manage (a Business/Creator 
 ## Adding another podcast or Substack
 
 The audio and Substack pipelines read their feed URL from `src/config.py`, so today a second `podcast_rss` or `substack` entry fails with a clear error. Parameterising those pipelines is the next step if more feeds are wanted.
+
+## YouTube failures
+
+A video that fails to ingest (no captions and no downloadable audio, a premiere, members-only) marks the `youtube` check failed for that run and is retried on the next runs. After 3 failed runs it is listed in `youtube_videos/metadata/_feed_failures.json` and skipped, so it can't block the backlog. Delete its entry to retry it.

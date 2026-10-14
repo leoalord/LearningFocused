@@ -21,7 +21,7 @@ class TestRegistry(unittest.TestCase):
         sources = {s.key: s for s in load_sources()}
         self.assertTrue({"art19", "substack", "youtube", "instagram"} <= set(sources))
         self.assertEqual(sources["youtube"].url, "https://www.youtube.com/@future_of_education/videos")
-        self.assertIn("About Gifted Minds", sources["youtube"].config["playlists"])
+        self.assertEqual(sources["youtube"].config, {"max_new_per_run": 10})
         for key in ("instagram", "x", "linkedin", "tiktok"):
             self.assertFalse(sources[key].enabled, key)
 
@@ -45,6 +45,9 @@ class TestRegistry(unittest.TestCase):
         self.assertTrue(is_due(weekly, now=TUESDAY, last_checked_at=TUESDAY - timedelta(days=7)))
         keys = [s.key for s in due_sources([daily, weekly, manual, off], now=TUESDAY)]
         self.assertEqual(keys, ["d"])
+        # With Postgres state, a weekly source that was never checked runs now.
+        keys = [s.key for s in due_sources([daily, weekly], now=TUESDAY, last_checked={})]
+        self.assertEqual(keys, ["d", "w"])
 
 
 class TestSocial(unittest.TestCase):
@@ -88,6 +91,37 @@ class TestDailyIngestRegistry(unittest.TestCase):
         self.assertTrue(ledger["sources"]["youtube"]["ok"])
         self.assertEqual(calls, [["--feed", "--max-new", "10"]])
         self.assertEqual(daily_ingest.DEFAULT_YOUTUBE_MAX_NEW, 10)
+
+    def test_youtube_video_failures_fail_the_source(self) -> None:
+        with patch("src.pipeline.youtube.run.main", return_value=1):
+            ledger = self._run(sources=["youtube"])
+        self.assertFalse(ledger["sources"]["youtube"]["ok"])
+        self.assertIn("videos failed", ledger["sources"]["youtube"]["error"])
+
+    def test_other_youtube_channels_are_refused(self) -> None:
+        registry = [SourceConfig(key="yt2", kind="youtube_channel", name="y",
+                                 url="https://www.youtube.com/@thealphaschool/videos")]
+        with patch("src.pipeline.youtube.run.main", side_effect=AssertionError("must not run")):
+            ledger = self._run(registry=registry)
+        self.assertFalse(ledger["sources"]["yt2"]["ok"])
+
+    def test_duplicate_source_runs_once(self) -> None:
+        ran: list[str] = []
+        ledger = self._run(sources=["art19", "art19"], source_runners={"art19": lambda: ran.append("a") or {}})
+        self.assertEqual(ran, ["a"])
+        self.assertEqual(list(ledger["sources"]), ["art19"])
+
+    def test_fallback_registry_is_not_mirrored_to_postgres(self) -> None:
+        with (
+            patch("src.pipeline.daily_ingest.load_sources", side_effect=ValueError("bad json")),
+            patch("src.feeds.state.is_enabled", return_value=True),
+            patch("src.feeds.state.sync_registry") as sync,
+            patch("src.feeds.state.last_checked", return_value={}),
+            patch("src.feeds.state.record_run", return_value=True),
+        ):
+            ledger = self._run(source_runners={"art19": lambda: {}, "substack": lambda: {}, "youtube": lambda: {}})
+        sync.assert_not_called()
+        self.assertEqual(list(ledger["sources"]), ["art19", "substack", "youtube"])
 
     def test_due_selection_and_skip(self) -> None:
         registry = [
@@ -159,17 +193,22 @@ class TestFeedStatePostgres(unittest.TestCase):
                     "instagram": {"ok": True, "detail": {"skipped": True}},
                 },
             }
+            ledger["sources"]["x"] = {"ok": False, "skipped": True, "error": "hydrate_failed"}
             self.assertTrue(state.record_run(ledger, dsn=db.dsn))
             checked = state.last_checked(dsn=db.dsn)
+            # x never ran (hydrate failed), so it stays due.
             self.assertEqual(set(checked), {"art19", "youtube", "instagram"})
             with pg_store.session(db.dsn) as conn:
                 rows = dict(conn.execute("SELECT key, last_error FROM sources WHERE key IN ('art19', 'youtube')").fetchall())
                 skipped = conn.execute(
                     "SELECT skipped FROM source_checks WHERE source_key = 'instagram'"
                 ).fetchone()[0]
+                ok_at = dict(conn.execute("SELECT key, last_ok_at FROM sources WHERE key IN ('art19', 'instagram')").fetchall())
             self.assertIsNone(rows["art19"])
             self.assertEqual(rows["youtube"], "RuntimeError: boom")
             self.assertTrue(skipped)
+            self.assertIsNotNone(ok_at["art19"])
+            self.assertIsNone(ok_at["instagram"])  # skipped is not a success
 
 
 if __name__ == "__main__":

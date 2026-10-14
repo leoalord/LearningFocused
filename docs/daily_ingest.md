@@ -28,7 +28,7 @@ Wrapped runners (Neo4j always skipped; `--force` off; `--reset-chroma` off). Lim
 
 - `podcast_rss` (Art19): `python -m src.pipeline.audio.run --skip-neo4j -- --mode daily --download-limit <download_limit>` (`DAILY_ART19_DOWNLOAD_LIMIT` env overrides)
 - `substack`: `python -m src.pipeline.substack.run --skip-neo4j -- --mode daily --ingest-limit <ingest_limit>`
-- `youtube_channel`: `python -m src.pipeline.youtube.run --feed --max-new <max_new_per_run>` (videos tab + the two playlists, deduplicated against podcast episodes by `skip.py`)
+- `youtube_channel`: `python -m src.pipeline.youtube.run --feed --max-new <max_new_per_run>` (videos tab + the two playlists, deduplicated against podcast episodes by `skip.py`; any failed video fails this source, and a video that fails 3 runs is set aside, see [feeds.md](feeds.md))
 - `instagram` / `x` / `linkedin` / `tiktok`: `src/feeds/social.py` (skipped until accounts and a credential are set)
 
 If `sources.json` can't be parsed, the job logs the error and runs the three core feeds anyway.
