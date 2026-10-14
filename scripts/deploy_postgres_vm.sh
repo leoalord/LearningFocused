@@ -77,13 +77,19 @@ if ! gcloud iam service-accounts describe "${SA_EMAIL}" --project="${PROJECT}" >
   gcloud iam service-accounts create "${SA_NAME}" --display-name="LearningFocused Postgres VM" --project="${PROJECT}"
   sleep 10
 fi
-echo ">> Granting the VM: image pull, password read, dump upload"
+echo ">> Granting the VM: image pull, password read, dump upload and read"
 gcloud artifacts repositories add-iam-policy-binding "${AR_REPO}" --location="${REGION}" \
   --member="serviceAccount:${SA_EMAIL}" --role="roles/artifactregistry.reader" --project="${PROJECT}" >/dev/null
 gcloud secrets add-iam-policy-binding "${SECRET_PASSWORD}" \
   --member="serviceAccount:${SA_EMAIL}" --role="roles/secretmanager.secretAccessor" --project="${PROJECT}" >/dev/null
 gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" \
   --member="serviceAccount:${SA_EMAIL}" --role="roles/storage.objectCreator" --project="${PROJECT}" >/dev/null
+# `gcloud storage cp` checks for an existing object before uploading, and restore-test downloads
+# the newest dump, so the VM also needs read access, limited to pg_dumps/ so it can't read the corpus.
+gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" \
+  --member="serviceAccount:${SA_EMAIL}" --role="roles/storage.objectViewer" --project="${PROJECT}" \
+  --condition="expression=resource.name.startsWith(\"projects/_/buckets/${BUCKET}/objects/pg_dumps/\"),title=pg-dumps-read" \
+  >/dev/null
 if [[ -z "$(gcloud storage buckets describe "gs://${BUCKET}" --project="${PROJECT}" --format='value(lifecycle_config)')" ]]; then
   echo ">> Bucket lifecycle: delete pg_dumps/ objects after 30 days"
   LIFECYCLE="$(mktemp)"
