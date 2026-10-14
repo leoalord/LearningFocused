@@ -1,0 +1,78 @@
+#cloud-config
+# Container-Optimized OS boot config for the LearningFocused Postgres VM.
+# Placeholders (__IMAGE__, __BUCKET__, __PROJECT__, __SECRET__) are filled in by
+# scripts/deploy_postgres_vm.sh before this file is passed as user-data.
+# Data lives on the attached persistent disk (device name "pgdata"), not the boot disk.
+
+write_files:
+  - path: /etc/systemd/system/pgdata-mount.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Format (first boot only) and mount the Postgres data disk
+      Before=learningfocused-postgres.service
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=true
+      ExecStart=/bin/bash -c 'DEV=/dev/disk/by-id/google-pgdata; blkid "$DEV" || mkfs.ext4 -m 0 -E lazy_itable_init=0,lazy_journal_init=0,discard "$DEV"; mkdir -p /mnt/disks/pgdata; mountpoint -q /mnt/disks/pgdata || mount -o discard,defaults "$DEV" /mnt/disks/pgdata; mkdir -p /mnt/disks/pgdata/data /mnt/disks/pgdata/backups'
+
+  - path: /etc/systemd/system/learningfocused-postgres.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=LearningFocused Postgres (pgvector + AGE)
+      Requires=pgdata-mount.service docker.service
+      After=pgdata-mount.service docker.service
+
+      [Service]
+      Restart=always
+      RestartSec=10
+      Environment=HOME=/home/pgsvc
+      ExecStartPre=/bin/mkdir -p /home/pgsvc /run/pgsecret
+      ExecStartPre=/usr/bin/docker-credential-gcr configure-docker --registries us-west1-docker.pkg.dev
+      ExecStartPre=/bin/bash -c 'docker run --rm gcr.io/google.com/cloudsdktool/google-cloud-cli:slim gcloud secrets versions access latest --secret=__SECRET__ --project=__PROJECT__ > /run/pgsecret/password && chmod 0444 /run/pgsecret/password'
+      ExecStartPre=-/usr/bin/docker rm -f pg
+      ExecStart=/usr/bin/docker run --name pg --shm-size=256m -p 5432:5432 \
+        -v /mnt/disks/pgdata/data:/var/lib/postgresql/data \
+        -v /run/pgsecret:/run/pgsecret:ro \
+        -e POSTGRES_USER=learningfocused -e POSTGRES_DB=learningfocused \
+        -e POSTGRES_PASSWORD_FILE=/run/pgsecret/password \
+        -e PGDATA=/var/lib/postgresql/data/pgdata \
+        __IMAGE__
+      ExecStop=/usr/bin/docker stop -t 60 pg
+
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/systemd/system/pg-backup.service
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Nightly pg_dump of the knowledge store to GCS
+      Requires=learningfocused-postgres.service
+      After=learningfocused-postgres.service
+
+      [Service]
+      Type=oneshot
+      Environment=HOME=/home/pgsvc
+      ExecStart=/bin/bash -c 'set -euo pipefail; STAMP=$(date -u +%%Y%%m%%dT%%H%%M%%SZ); OUT=/mnt/disks/pgdata/backups/learningfocused-$STAMP.dump; docker exec pg pg_dump -U learningfocused -Fc learningfocused > "$OUT"; docker run --rm -v /mnt/disks/pgdata/backups:/backups gcr.io/google.com/cloudsdktool/google-cloud-cli:slim gcloud storage cp "/backups/$(basename "$OUT")" gs://__BUCKET__/pg_dumps/ --project=__PROJECT__; find /mnt/disks/pgdata/backups -name "*.dump" -mtime +3 -delete'
+
+  - path: /etc/systemd/system/pg-backup.timer
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Run pg-backup nightly at 03:30 UTC (after nothing else touches the DB)
+
+      [Timer]
+      OnCalendar=*-*-* 03:30:00 UTC
+      Persistent=true
+
+      [Install]
+      WantedBy=timers.target
+
+runcmd:
+  - systemctl daemon-reload
+  - systemctl start pgdata-mount.service
+  - systemctl start learningfocused-postgres.service
+  - systemctl start pg-backup.timer
