@@ -27,15 +27,16 @@ CREATE TABLE IF NOT EXISTS documents (
     source_type  text,
     title        text,
     url          text,
-    published_at text,
+    published_at timestamptz,
     metadata     jsonb NOT NULL DEFAULT '{}'::jsonb,
     updated_at   timestamptz NOT NULL DEFAULT now()
 );
 
 -- One row per retrievable chunk (same ids and `type` values as the Chroma collection).
+-- Writers upsert the document row first; deleting a document drops its chunks.
 CREATE TABLE IF NOT EXISTS chunks (
     id         text PRIMARY KEY,
-    doc_id     text,
+    doc_id     text REFERENCES documents (doc_id) ON DELETE CASCADE,
     type       text NOT NULL,
     content    text NOT NULL,
     metadata   jsonb NOT NULL DEFAULT '{}'::jsonb,
@@ -59,6 +60,8 @@ CREATE TABLE IF NOT EXISTS ingest_runs (
     detail      jsonb NOT NULL DEFAULT '{}'::jsonb
 );
 
+-- source_key is deliberately not a foreign key: check history outlives a source that
+-- is later removed from src/feeds/sources.json.
 CREATE TABLE IF NOT EXISTS source_checks (
     run_id     text NOT NULL REFERENCES ingest_runs (run_id) ON DELETE CASCADE,
     source_key text NOT NULL,
@@ -69,3 +72,17 @@ CREATE TABLE IF NOT EXISTS source_checks (
     checked_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (run_id, source_key)
 );
+
+-- Keep updated_at honest on every UPDATE (inserts use the column default).
+CREATE OR REPLACE FUNCTION set_updated_at() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.updated_at := now();
+    RETURN NEW;
+END $$;
+
+CREATE OR REPLACE TRIGGER sources_updated_at BEFORE UPDATE ON sources
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+CREATE OR REPLACE TRIGGER documents_updated_at BEFORE UPDATE ON documents
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+CREATE OR REPLACE TRIGGER chunks_updated_at BEFORE UPDATE ON chunks
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();

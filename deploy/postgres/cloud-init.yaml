@@ -1,10 +1,60 @@
 #cloud-config
 # Container-Optimized OS boot config for the LearningFocused Postgres VM.
 # Placeholders (__IMAGE__, __BUCKET__, __PROJECT__, __SECRET__) are filled in by
-# scripts/deploy_postgres_vm.sh before this file is passed as user-data.
+# scripts/deploy_postgres_vm.sh before this file is passed as user-data. __IMAGE__ is a
+# digest reference (…/postgres@sha256:…), so a new build is always pulled and run.
 # Data lives on the attached persistent disk (device name "pgdata"), not the boot disk.
+# Shell logic lives in scripts under /etc/learningfocused (run with bash, since COS
+# mounts some paths noexec) so systemd never has to expand shell variables.
 
 write_files:
+  - path: /etc/learningfocused/mount-pgdata.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      # Format the data disk on first boot only, then mount it.
+      set -euo pipefail
+      DEV=/dev/disk/by-id/google-pgdata
+      blkid "$DEV" || mkfs.ext4 -m 0 -E lazy_itable_init=0,lazy_journal_init=0,discard "$DEV"
+      mkdir -p /mnt/disks/pgdata
+      mountpoint -q /mnt/disks/pgdata || mount -o discard,defaults "$DEV" /mnt/disks/pgdata
+      mkdir -p /mnt/disks/pgdata/data /mnt/disks/pgdata/backups
+
+  - path: /etc/learningfocused/fetch-password.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      # Read the superuser password from Secret Manager into a file only the container's
+      # postgres user (uid 999) can read. Fails, rather than writing an empty file, if
+      # the secret can't be read.
+      set -euo pipefail
+      install -d -m 0700 -o 999 -g 999 /run/pgsecret
+      tmp="$(mktemp /run/pgsecret/.password.XXXXXX)"
+      trap 'rm -f "$tmp"' EXIT
+      docker run --rm gcr.io/google.com/cloudsdktool/google-cloud-cli:slim \
+        gcloud secrets versions access latest --secret=__SECRET__ --project=__PROJECT__ > "$tmp"
+      test -s "$tmp"
+      chown 999:999 "$tmp"
+      chmod 0400 "$tmp"
+      mv "$tmp" /run/pgsecret/password
+
+  - path: /etc/learningfocused/backup.sh
+    permissions: "0755"
+    content: |
+      #!/bin/bash
+      # pg_dump to the data disk, copy to GCS, keep three days locally.
+      # Writes to .tmp and renames, so a failed dump never looks like a good one.
+      set -euo pipefail
+      stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+      dir=/mnt/disks/pgdata/backups
+      name="learningfocused-${stamp}.dump"
+      docker exec pg pg_dump -U learningfocused -Fc learningfocused > "${dir}/${name}.tmp"
+      mv "${dir}/${name}.tmp" "${dir}/${name}"
+      docker run --rm -v "${dir}:/backups:ro" gcr.io/google.com/cloudsdktool/google-cloud-cli:slim \
+        gcloud storage cp "/backups/${name}" "gs://__BUCKET__/pg_dumps/${name}" --project=__PROJECT__
+      find "${dir}" -name '*.dump' -mtime +3 -delete
+      find "${dir}" -name '*.tmp' -delete
+
   - path: /etc/systemd/system/pgdata-mount.service
     permissions: "0644"
     content: |
@@ -15,7 +65,7 @@ write_files:
       [Service]
       Type=oneshot
       RemainAfterExit=true
-      ExecStart=/bin/bash -c 'DEV=/dev/disk/by-id/google-pgdata; blkid "$DEV" || mkfs.ext4 -m 0 -E lazy_itable_init=0,lazy_journal_init=0,discard "$DEV"; mkdir -p /mnt/disks/pgdata; mountpoint -q /mnt/disks/pgdata || mount -o discard,defaults "$DEV" /mnt/disks/pgdata; mkdir -p /mnt/disks/pgdata/data /mnt/disks/pgdata/backups'
+      ExecStart=/bin/bash /etc/learningfocused/mount-pgdata.sh
 
   - path: /etc/systemd/system/learningfocused-postgres.service
     permissions: "0644"
@@ -29,9 +79,10 @@ write_files:
       Restart=always
       RestartSec=10
       Environment=HOME=/home/pgsvc
-      ExecStartPre=/bin/mkdir -p /home/pgsvc /run/pgsecret
+      ExecStartPre=/bin/mkdir -p /home/pgsvc
       ExecStartPre=/usr/bin/docker-credential-gcr configure-docker --registries us-west1-docker.pkg.dev
-      ExecStartPre=/bin/bash -c 'docker run --rm gcr.io/google.com/cloudsdktool/google-cloud-cli:slim gcloud secrets versions access latest --secret=__SECRET__ --project=__PROJECT__ > /run/pgsecret/password && chmod 0444 /run/pgsecret/password'
+      ExecStartPre=/bin/bash /etc/learningfocused/fetch-password.sh
+      ExecStartPre=/usr/bin/docker pull __IMAGE__
       ExecStartPre=-/usr/bin/docker rm -f pg
       ExecStart=/usr/bin/docker run --name pg --shm-size=256m -p 5432:5432 \
         -v /mnt/disks/pgdata/data:/var/lib/postgresql/data \
@@ -56,7 +107,7 @@ write_files:
       [Service]
       Type=oneshot
       Environment=HOME=/home/pgsvc
-      ExecStart=/bin/bash -c 'set -euo pipefail; STAMP=$(date -u +%%Y%%m%%dT%%H%%M%%SZ); OUT=/mnt/disks/pgdata/backups/learningfocused-$STAMP.dump; docker exec pg pg_dump -U learningfocused -Fc learningfocused > "$OUT"; docker run --rm -v /mnt/disks/pgdata/backups:/backups gcr.io/google.com/cloudsdktool/google-cloud-cli:slim gcloud storage cp "/backups/$(basename "$OUT")" gs://__BUCKET__/pg_dumps/ --project=__PROJECT__; find /mnt/disks/pgdata/backups -name "*.dump" -mtime +3 -delete'
+      ExecStart=/bin/bash /etc/learningfocused/backup.sh
 
   - path: /etc/systemd/system/pg-backup.timer
     permissions: "0644"

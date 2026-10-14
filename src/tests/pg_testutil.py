@@ -20,6 +20,13 @@ def _with_dbname(dsn: str, dbname: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, f"/{dbname}", parts.query, parts.fragment))
 
 
+def with_credentials(dsn: str, user: str, password: str) -> str:
+    """Same server and database, different login."""
+    parts = urlsplit(dsn)
+    host = parts.netloc.rsplit("@", 1)[-1]
+    return urlunsplit((parts.scheme, f"{user}:{password}@{host}", parts.path, parts.query, parts.fragment))
+
+
 class TempDatabase:
     """Create a uniquely named database on enter, drop it on exit."""
 
