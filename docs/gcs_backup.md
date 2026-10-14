@@ -12,7 +12,7 @@ The gitignored corpus lives in **one private GCS bucket**. This is an off-laptop
 | Access | Uniform bucket-level access, public access prevention **enforced**, no public objects |
 | Storage class | Standard |
 
-Everything for LearningFocused lives in the LearningFocus project (`gen-lang-client-0304733057`, the same project as `.env` `GCP_PROJECT_ID`). Do **not** put LearningFocused resources in `inferpoker`; that project belongs to InferPoker. The corpus was first created in `gs://inferpoker-learningfocused`; `./scripts/migrate_to_learningfocus.sh` copies it here.
+Everything for LearningFocused lives in the LearningFocus project (`gen-lang-client-0304733057`, the scripts' default; `GCP_BACKUP_PROJECT` overrides it, see `scripts/_gcp_env.sh`). Do **not** put LearningFocused resources in `inferpoker`; that project belongs to InferPoker. The corpus was first created in `gs://inferpoker-learningfocused`; `./scripts/migrate_to_learningfocus.sh` copies it here.
 
 ## Moving from inferpoker (one time)
 

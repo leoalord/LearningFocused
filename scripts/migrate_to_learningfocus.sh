@@ -31,6 +31,15 @@ if ! gcloud storage buckets describe "gs://${BUCKET}" --project="${PROJECT}" >/d
     --default-storage-class=STANDARD \
     --uniform-bucket-level-access \
     --public-access-prevention
+else
+  # An existing bucket must have the same protections a new one gets.
+  read -r ubla pap < <(gcloud storage buckets describe "gs://${BUCKET}" --project="${PROJECT}" \
+    --format='value(uniform_bucket_level_access,public_access_prevention)')
+  if [[ "${ubla}" != "True" || "${pap}" != "enforced" ]]; then
+    echo ">> Enforcing uniform access + public access prevention on existing gs://${BUCKET}"
+    gcloud storage buckets update "gs://${BUCKET}" --project="${PROJECT}" \
+      --uniform-bucket-level-access --public-access-prevention
+  fi
 fi
 
 # Stop the old daily job first so nothing lands in the old bucket after the copy and
@@ -46,8 +55,19 @@ echo ">> Copying gs://${OLD_BUCKET} -> gs://${BUCKET} (checksum rsync, includes 
 gcloud storage rsync "gs://${OLD_BUCKET}" "gs://${BUCKET}" \
   --recursive --checksums-only --project="${PROJECT}"
 
+count_objects() {
+  gcloud storage ls -r "gs://$1/**" --project="${PROJECT}" | grep -vc '/$' || true
+}
+old_count="$(count_objects "${OLD_BUCKET}")"
+new_count="$(count_objects "${BUCKET}")"
+echo ">> Objects: gs://${OLD_BUCKET}=${old_count} gs://${BUCKET}=${new_count}"
+if (( new_count < old_count )); then
+  echo "The copy is missing objects. Re-run this script; do not retire anything in ${OLD_PROJECT}." >&2
+  exit 1
+fi
+
 echo
-echo "Copied. Next:"
+echo "Copied and verified. Next:"
 echo "  ./scripts/deploy_mcp.sh          # seeds secrets from .env, deploys learningfocused-mcp"
 echo "  ./scripts/deploy_ingest_job.sh   # daily job + scheduler (needs the MCP deploy first)"
 echo
