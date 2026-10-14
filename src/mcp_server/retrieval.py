@@ -1,10 +1,17 @@
-"""Thin search/fetch wrappers around query_segments / query_summaries.
+"""Thin search/fetch wrappers over the knowledge store the server is configured for.
 
-Used in-process by evals and by the public FastMCP tools. Not a Cypher surface.
+`KB_BACKEND=chroma` (default) uses the hydrated Chroma snapshot (query_segments /
+query_summaries). `KB_BACKEND=postgres` reads Postgres live through `PG_DSN`
+(src/database/pg_search.py), with `KB_SEARCH_MODE` = vector (default, same ranking as
+Chroma), keyword or hybrid for the `search` tool.
+
+Used in-process by evals and by the public FastMCP tools. Callers never send query text
+to a database: graph access is a fixed set of templates.
 """
 
 from __future__ import annotations
 
+import os
 from typing import List, Optional, Tuple
 
 from langchain_core.documents import Document
@@ -24,7 +31,24 @@ from src.mcp_server.caps import (
     max_summaries_cap,
 )
 
+BACKENDS = ("chroma", "postgres")
 _STORE = None
+
+
+def backend() -> str:
+    value = (os.getenv("KB_BACKEND") or "chroma").strip().lower()
+    if value not in BACKENDS:
+        raise ValueError(f"KB_BACKEND must be one of {BACKENDS}, got {value!r}")
+    return value
+
+
+def search_mode() -> str:
+    from src.database.pg_search import SEARCH_MODES
+
+    value = (os.getenv("KB_SEARCH_MODE") or "vector").strip().lower()
+    if value not in SEARCH_MODES:
+        raise ValueError(f"KB_SEARCH_MODE must be one of {SEARCH_MODES}, got {value!r}")
+    return value
 
 
 def _read_only_store():
@@ -40,11 +64,28 @@ def retrieve_documents(
     max_segments: int = DEFAULT_MAX_SEGMENTS,
     max_summaries: int = DEFAULT_MAX_SUMMARIES,
     filter_metadata: Optional[dict] = None,
+    mode: Optional[str] = None,
+    kb_backend: Optional[str] = None,
 ) -> Tuple[List[Document], List[Document]]:
-    """Bounded retrieval used by MCP tools and evals (full page_content)."""
+    """Bounded retrieval used by MCP tools and evals (full page_content).
+
+    `mode` (vector / keyword / hybrid) applies to the postgres backend; Chroma is vector only.
+    `filter_metadata` applies to the chroma backend; postgres fetches by id in `fetch`.
+    `kb_backend` overrides KB_BACKEND for this call (evals compare backends with it).
+    """
     q = bound_query(query)
     k_seg = clamp_k(max_segments, cap=max_segments_cap(), default=DEFAULT_MAX_SEGMENTS)
     k_sum = clamp_k(max_summaries, cap=max_summaries_cap(), default=DEFAULT_MAX_SUMMARIES)
+    if kb_backend is not None and kb_backend not in BACKENDS:
+        raise ValueError(f"kb_backend must be one of {BACKENDS}, got {kb_backend!r}")
+    if (kb_backend or backend()) == "postgres":
+        if filter_metadata:
+            raise ValueError("filter_metadata is a chroma-backend option; use fetch for ids")
+        from src.database import pg_search
+
+        return pg_search.retrieve(q, mode=mode or search_mode(), max_segments=k_seg, max_summaries=k_sum)
+    if mode not in (None, "vector"):
+        raise ValueError(f"search mode {mode!r} needs KB_BACKEND=postgres")
     store = _read_only_store()
     summaries = (
         query_summaries(q, k=k_sum, filter_metadata=filter_metadata, vector_store=store)
@@ -77,12 +118,14 @@ def search(
     max_segments: int = DEFAULT_MAX_SEGMENTS,
     max_summaries: int = DEFAULT_MAX_SUMMARIES,
     snippet_limit: int = DEFAULT_SNIPPET_LIMIT,
+    mode: Optional[str] = None,
 ) -> SearchResults:
-    """Semantic search over the education corpus. Returns attributed snippets."""
+    """Search the education corpus (semantic by default). Returns attributed snippets."""
     summaries, segments = retrieve_documents(
         query,
         max_segments=max_segments,
         max_summaries=max_summaries,
+        mode=mode,
     )
     return documents_to_search_results(summaries, segments, snippet_limit=snippet_limit)
 
@@ -115,6 +158,15 @@ def fetch(
     source_id = bound_id(id)
     if not source_id:
         return SearchResults()
+    if backend() == "postgres":
+        from src.database import pg_search
+
+        summaries, segments = pg_search.fetch_documents(
+            source_id,
+            max_segments=clamp_k(max_segments, cap=max_segments_cap(), default=DEFAULT_MAX_SEGMENTS),
+            max_summaries=clamp_k(max_summaries, cap=max_summaries_cap(), default=DEFAULT_MAX_SUMMARIES),
+        )
+        return documents_to_search_results(summaries, segments, snippet_limit=snippet_limit)
     for metadata_filter in _filters_for_id(source_id):
         summaries, segments = retrieve_documents(
             source_id,

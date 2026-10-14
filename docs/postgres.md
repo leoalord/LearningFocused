@@ -21,7 +21,7 @@ Tables: `sources` (every feed the daily job checks), `documents`, `chunks`, `ing
 | Backups | Nightly `pg_dump -Fc` at 03:30 UTC to `gs://learningfocused-corpus/pg_dumps/` (deleted after 30 days by a bucket lifecycle rule; 3 days also kept on the disk) |
 | Access | Port 5432 from the default subnet only (Cloud Run Direct VPC egress); SSH and admin tunnels only through IAP |
 | Roles | `learningfocused` (superuser: migrations and admin over IAP only) and `learningfocused_app` (no superuser; DML, graph reads/writes; what Cloud Run uses) |
-| Secrets | `learningfocused-pg-password`, `learningfocused-pg-app-password` (random), `learningfocused-pg-dsn` (app-role DSN, read by Cloud Run as `PG_DSN`) |
+| Secrets | `learningfocused-pg-password`, `learningfocused-pg-app-password`, `learningfocused-pg-reader-password` (random); `learningfocused-pg-dsn` (read-write app role, the daily job's `PG_DSN`); `learningfocused-pg-dsn-reader` (read-only `learningfocused_mcp`, max 15 connections, the MCP server's `PG_DSN`) |
 | Logs | Container logs and VM metrics go to Cloud Logging/Monitoring (`google-logging-enabled` metadata) |
 
 Approximate cost: e2-small ~$12–13/month, disk + snapshots ~$2–3/month, no external IP charge.
@@ -37,15 +37,17 @@ gcloud compute start-iap-tunnel learningfocused-pg 5432 --local-host-port=localh
   --zone=us-west1-b --project=gen-lang-client-0304733057 &
 export PGPASSWORD="$(gcloud secrets versions access latest --secret=learningfocused-pg-password --project=gen-lang-client-0304733057)"
 export PG_APP_PASSWORD="$(gcloud secrets versions access latest --secret=learningfocused-pg-app-password --project=gen-lang-client-0304733057)"
+export PG_READER_PASSWORD="$(gcloud secrets versions access latest --secret=learningfocused-pg-reader-password --project=gen-lang-client-0304733057)"
 PG_DSN=postgresql://learningfocused@localhost:6543/learningfocused \
-  uv run python -m src.database.pg_store migrate --app-role
-unset PGPASSWORD PG_APP_PASSWORD
+  uv run python -m src.database.pg_store migrate --app-role --reader-role
+unset PGPASSWORD PG_APP_PASSWORD PG_READER_PASSWORD
 
 ./scripts/pg_backup.sh dump-now          # first backup; also proves the VM can write to the bucket
 ./scripts/pg_backup.sh restore-test      # gate: the GCS copy restores into a scratch database and Cypher works
 
-Re-run `migrate --app-role` after any admin-side graph import: AGE adds a table per new label,
-and the app role must own those tables to add more labels later.
+Re-run `migrate --app-role --reader-role` after any admin-side graph import: AGE adds a table
+per new label, the app role must own those tables to add more labels later, and the reader
+role needs SELECT on them.
 ```
 
 ## Filling it: Chroma backfill, daily dual-write, Neo4j graph
@@ -75,6 +77,10 @@ PG_DSN=postgresql://learningfocused@localhost:6543/learningfocused \
 Nodes and relationships are streamed and written in batches (`--batch-size`, default 1000), each batch in its own transaction. `age_import_map` records every copied Neo4j `elementId`, so an interrupted run is finished by running it again. Don't change the Neo4j graph between an interrupted run and its re-run: Neo4j can reuse ids of deleted items, and a reused id would be taken as already copied. The script prints Neo4j's counts next to what AGE holds and exits non-zero until they match; relationships whose end nodes were not imported are reported separately, since re-running can't fix those. `IngestedDoc` bookkeeping nodes (and their relationships) are skipped. Before writing, it checks that no two Neo4j labels or relationship types reduce to the same AGE name. Each node gets one AGE label (its first label other than `__Entity__`) and keeps all its Neo4j labels in a `labels` property; `embedding` properties are dropped unless `--keep-property embedding`. `--grant-to` hands the new label tables to the app role so it can keep adding to the graph.
 
 Neither tool deletes anything in Chroma or Neo4j.
+
+## Serving it
+
+`src/database/pg_search.py` holds the read-only retrieval (keyword, vector, hybrid, graph templates). The MCP server uses it when deployed with `KB_BACKEND=postgres`; the tools, the eval comparison and the switch are in [mcp_server.md](mcp_server.md). Once `deploy_postgres_vm.sh` has created the DSN secret, `./scripts/deploy_ingest_job.sh` also gives the daily job `PG_DSN` and VPC egress (`INGEST_PG=0` opts out).
 
 ## Local development
 

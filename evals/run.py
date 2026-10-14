@@ -3,6 +3,7 @@
 Usage:
     uv run python -m evals.run
     uv run python -m evals.run --report evals/last_report.json
+    uv run python -m evals.run --backend postgres --mode hybrid   # needs PG_DSN
 
 Does not reset, add, or delete Chroma documents. Queries the same helpers
 the FastMCP search/fetch tools wrap (query_segments + query_summaries)
@@ -66,6 +67,19 @@ def _connect_collection():
         return client.get_collection(name=COLLECTION_NAME)
     except Exception as exc:  # pragma: no cover - environment-dependent
         _fail(f"Could not open Chroma collection {COLLECTION_NAME!r}: {exc}")
+
+
+class _PostgresProbe:
+    """Answers `_first_where` from Postgres chunk metadata, like a Chroma collection.get."""
+
+    def get(self, *, where: dict[str, Any], limit: int, include: list[str]) -> dict[str, Any]:
+        from src.database.pg_search import read_only
+
+        del include
+        with read_only() as conn:
+            rows = conn.execute("SELECT id FROM chunks WHERE metadata @> %s::jsonb LIMIT %s",
+                                (json.dumps(where), limit)).fetchall()
+        return {"ids": [r[0] for r in rows]}
 
 
 def _first_where(collection, where: dict[str, Any]) -> bool:
@@ -143,12 +157,15 @@ def inspect_corpus(
     return status
 
 
-def retrieve(question: str, *, max_segments: int, max_summaries: int):
-    # Same retrieve_documents() the FastMCP search tool wraps (in-process).
+def retrieve(question: str, *, max_segments: int, max_summaries: int, backend: str = "chroma",
+             mode: str | None = None):
+    # Same retrieve_documents() the FastMCP search tools wrap (in-process).
     return retrieve_documents(
         question,
         max_segments=max_segments,
         max_summaries=max_summaries,
+        mode=mode,
+        kb_backend=backend,
     )
 
 
@@ -157,9 +174,16 @@ def evaluate(
     *,
     max_segments: int,
     max_summaries: int,
+    backend: str = "chroma",
+    mode: str | None = None,
 ) -> dict[str, Any]:
-    _assert_chroma_readable()
-    collection = _connect_collection()
+    if backend == "chroma":
+        _assert_chroma_readable()
+        collection = _connect_collection()
+    else:
+        # Miss analysis ("indexed") checks the same store the questions ran against.
+        collection = _PostgresProbe()
+        mode = mode or "vector"  # explicit, so KB_SEARCH_MODE in the shell can't change it
 
     per_question: list[dict[str, Any]] = []
     hits = 0
@@ -173,6 +197,8 @@ def evaluate(
                 q.question,
                 max_segments=max_segments,
                 max_summaries=max_summaries,
+                backend=backend,
+                mode=mode,
             )
         except Exception as exc:
             missed_ids.append(q.id)
@@ -274,8 +300,12 @@ def evaluate(
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "command": "uv run python -m evals.run",
+        "command": "uv run python -m evals.run"
+        + (f" --backend {backend}" if backend != "chroma" else "")
+        + (f" --mode {mode}" if mode else ""),
         "retriever": {
+            "backend": backend,
+            "mode": mode or "vector",
             "helpers": [
                 "src.mcp_server.retrieval.retrieve_documents",
                 "query_summaries",
@@ -331,7 +361,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--report", type=Path, default=DEFAULT_REPORT, help="JSON report output path")
     parser.add_argument("--max-segments", type=int, default=DEFAULT_MAX_SEGMENTS)
     parser.add_argument("--max-summaries", type=int, default=DEFAULT_MAX_SUMMARIES)
-    return parser.parse_args(argv)
+    parser.add_argument("--backend", choices=["chroma", "postgres"], default="chroma",
+                        help="Store to query (postgres reads PG_DSN).")
+    parser.add_argument("--mode", choices=["vector", "keyword", "hybrid"], default=None,
+                        help="Postgres search style (default vector, the same ranking as Chroma).")
+    args = parser.parse_args(argv)
+    if args.mode and args.mode != "vector" and args.backend != "postgres":
+        parser.error("--mode keyword/hybrid needs --backend postgres")
+    return args
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -347,6 +384,8 @@ def main(argv: list[str] | None = None) -> None:
         questions,
         max_segments=args.max_segments,
         max_summaries=args.max_summaries,
+        backend=args.backend,
+        mode=args.mode,
     )
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")

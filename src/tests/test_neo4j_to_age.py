@@ -37,6 +37,9 @@ class TestMapping(unittest.TestCase):
             ("embedding",),
         ))
         self.assertEqual(props, {"text": "t", "score": None, "labels": ["Document"], "neo4j_id": "7"})
+        named = json.loads(node_properties(NodeRow("8", ["Person"], {"id": "MacKenzie Price"}), ()))
+        self.assertEqual(named["name_lc"], "mackenzie price")
+        self.assertEqual(json.loads(node_properties(NodeRow("9", ["Tool"], {"id": 42}), ()))["name_lc"], "42")
 
 
 def _graph():

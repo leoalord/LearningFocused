@@ -13,6 +13,7 @@ Build a queryable knowledge base from a corpus of podcast audio + transcripts + 
 - **GCS backup** (off-laptop; one private bucket): see `docs/gcs_backup.md`
 - **Chroma**: embeddings for transcript segments + summary-like docs + Substack text/summaries
 - **Neo4j**: graph extraction over Documents (good for “what’s connected to what?”)
+- **Postgres** (pgvector + Apache AGE + full-text, one small VM): the replacement for Chroma and Neo4j, filled from both and kept in step daily; see `docs/postgres.md`
 
 ## Quick start
 
@@ -127,7 +128,7 @@ See deeper docs: `src/react_agent/README.md`.
 
 ### Public MCP (Streamable HTTP)
 
-Same FastMCP 4 binary locally and on Cloud Run. Tools are `search` and `fetch`. See `docs/mcp_server.md`.
+Same FastMCP 4 binary locally and on Cloud Run. Tools are `search` and `fetch`; with `KB_BACKEND=postgres` also `keyword_search`, `vector_search`, `hybrid_search` and `graph_query`. See `docs/mcp_server.md`.
 
 ```bash
 uv run python -m src.mcp_server

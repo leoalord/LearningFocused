@@ -2,6 +2,15 @@
 # Deploy the FastMCP HTTP server to Cloud Run (LearningFocus gen-lang-client-0304733057 / us-west1).
 # Deploys to the LearningFocus project (same as GCP_PROJECT_ID in .env).
 # Does not --reset-chroma, re-transcribe, or touch the podcast_downloads rsync.
+#
+# KB_BACKEND picks the store the server reads:
+#   chroma (default)  hydrate the Chroma snapshot from GCS at boot; min 1 instance, 2Gi.
+#   postgres          read the Postgres VM live over Direct VPC egress as the read-only
+#                     learningfocused_mcp role (PG_DSN from the learningfocused-pg-dsn-reader
+#                     secret, made by deploy_postgres_vm.sh); adds the keyword/vector/hybrid/
+#                     graph tools; no hydrate, so it scales to zero (first request after idle
+#                     pays a cold start of a few seconds).
+# Roll back to Chroma at any time with KB_BACKEND=chroma ./scripts/deploy_mcp.sh.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -17,6 +26,43 @@ SECRET_GOOGLE="${SECRET_GOOGLE:-learningfocused-google-api-key}"
 SECRET_ASSEMBLYAI="${SECRET_ASSEMBLYAI:-learningfocused-assemblyai-api-key}"
 ENV_FILE="${ROOT}/.env"
 UPDATE_SECRETS="${UPDATE_SECRETS:-0}"
+KB_BACKEND="${KB_BACKEND:-chroma}"
+KB_SEARCH_MODE="${KB_SEARCH_MODE:-vector}"
+SECRET_DSN="${SECRET_PG_READER_DSN:-learningfocused-pg-dsn-reader}"
+INGEST_JOB="${CLOUD_RUN_JOB:-learningfocused-ingest}"
+NETWORK="${PG_NETWORK:-default}"
+SUBNET="${PG_SUBNET:-default}"
+
+case "${KB_BACKEND}" in
+  chroma)
+    MIN_INSTANCES="${MCP_MIN_INSTANCES:-1}"
+    MEMORY="${MCP_MEMORY:-2Gi}"
+    CONCURRENCY="${MCP_CONCURRENCY:-80}"
+    ;;
+  postgres)
+    MIN_INSTANCES="${MCP_MIN_INSTANCES:-0}"
+    MEMORY="${MCP_MEMORY:-1Gi}"
+    # Each instance holds at most PG_MAX_CONNECTIONS (4) connections; keep requests per
+    # instance near that so they queue at Cloud Run, not inside the server.
+    CONCURRENCY="${MCP_CONCURRENCY:-8}"
+    ;;
+  *)
+    echo "KB_BACKEND must be chroma or postgres (got ${KB_BACKEND})" >&2
+    exit 2
+    ;;
+esac
+case "${KB_SEARCH_MODE}" in
+  vector|keyword|hybrid) ;;
+  *) echo "KB_SEARCH_MODE must be vector, keyword or hybrid (got ${KB_SEARCH_MODE})" >&2; exit 2 ;;
+esac
+if ! [[ "${MIN_INSTANCES}" =~ ^[0-9]+$ && "${CONCURRENCY}" =~ ^[0-9]+$ ]]; then
+  echo "MCP_MIN_INSTANCES and MCP_CONCURRENCY must be whole numbers." >&2
+  exit 2
+fi
+if [[ "${KB_BACKEND}" == "chroma" && "${MIN_INSTANCES}" -lt 1 ]]; then
+  echo "The chroma backend hydrates at boot and the daily roll refuses min-instances 0; use MCP_MIN_INSTANCES>=1." >&2
+  exit 2
+fi
 
 if [[ ! -f "${ENV_FILE}" ]]; then
   echo "Missing ${ENV_FILE} (needed to seed Secret Manager). Not committed." >&2
@@ -91,7 +137,22 @@ ensure_secret "${SECRET_OPENAI}" "OPENAI_API_KEY"
 ensure_secret "${SECRET_GOOGLE}" "GOOGLE_API_KEY"
 ensure_secret "${SECRET_ASSEMBLYAI}" "ASSEMBLYAI_API_KEY"
 
-for secret in "${SECRET_OPENAI}" "${SECRET_GOOGLE}" "${SECRET_ASSEMBLYAI}"; do
+RUNTIME_SECRETS=("${SECRET_OPENAI}" "${SECRET_GOOGLE}" "${SECRET_ASSEMBLYAI}")
+if [[ "${KB_BACKEND}" == "postgres" ]]; then
+  if ! gcloud secrets describe "${SECRET_DSN}" --project="${PROJECT}" >/dev/null 2>&1; then
+    echo "Secret ${SECRET_DSN} not found. Run ./scripts/deploy_postgres_vm.sh first." >&2
+    exit 1
+  fi
+  RUNTIME_SECRETS+=("${SECRET_DSN}")
+  # The service only sees new content through the daily job's Chroma -> Postgres copy.
+  if ! gcloud run jobs describe "${INGEST_JOB}" --region="${REGION}" --project="${PROJECT}" \
+      --format=json 2>/dev/null | grep -q '"PG_DSN"'; then
+    echo "WARNING: ${INGEST_JOB} has no PG_DSN, so Postgres won't get new content." >&2
+    echo "         Re-run ./scripts/deploy_ingest_job.sh (it wires Postgres once the DSN secret exists)." >&2
+  fi
+fi
+
+for secret in "${RUNTIME_SECRETS[@]}"; do
   echo ">> Granting secretAccessor on ${secret}"
   gcloud secrets add-iam-policy-binding "${secret}" \
     --member="serviceAccount:${SA_EMAIL}" \
@@ -103,7 +164,21 @@ PROJECT_NUMBER="$(gcloud projects describe "${PROJECT}" --format='value(projectN
 COMPUTE_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
 echo ">> Cloud Run --source builds as ${COMPUTE_SA} (project Editor). Runtime SA is ${SA_EMAIL}."
 
-echo ">> Deploying ${SERVICE} to Cloud Run (${REGION})"
+ENV_VARS="MCP_HOST=0.0.0.0,GCS_CHROMA_BUCKET=${BUCKET},GCP_BACKUP_PROJECT=${PROJECT},CHROMA_DIR=/data/chroma_db,MCP_RATE_LIMIT_PER_MINUTE=60,KB_BACKEND=${KB_BACKEND},KB_SEARCH_MODE=${KB_SEARCH_MODE}"
+SECRETS="OPENAI_API_KEY=${SECRET_OPENAI}:latest,GOOGLE_API_KEY=${SECRET_GOOGLE}:latest,ASSEMBLYAI_API_KEY=${SECRET_ASSEMBLYAI}:latest"
+if [[ "${KB_BACKEND}" == "postgres" ]]; then
+  # Private IPs only go through the VPC (the Postgres VM has no external IP); the
+  # OpenAI embedding calls still leave directly. Its firewall allows this subnet.
+  ENV_VARS+=",HYDRATE_CHROMA=0,PG_MAX_CONNECTIONS=4"
+  SECRETS+=",PG_DSN=${SECRET_DSN}:latest"
+  BACKEND_FLAGS=(--network="${NETWORK}" --subnet="${SUBNET}" --vpc-egress=private-ranges-only --cpu-throttling)
+else
+  ENV_VARS+=",HYDRATE_CHROMA=1"
+  # Chroma serves from instance memory/disk, so keep CPU always on; drop any VPC egress.
+  BACKEND_FLAGS=(--clear-network --no-cpu-throttling)
+fi
+
+echo ">> Deploying ${SERVICE} to Cloud Run (${REGION}, backend ${KB_BACKEND}, min instances ${MIN_INSTANCES})"
 gcloud run deploy "${SERVICE}" \
   --quiet \
   --source "${ROOT}" \
@@ -111,16 +186,17 @@ gcloud run deploy "${SERVICE}" \
   --region="${REGION}" \
   --service-account="${SA_EMAIL}" \
   --allow-unauthenticated \
-  --min-instances=1 \
+  --min-instances="${MIN_INSTANCES}" \
+  --concurrency="${CONCURRENCY}" \
   --max-instances=3 \
-  --memory=2Gi \
+  --memory="${MEMORY}" \
   --cpu=1 \
   --timeout=300 \
   --cpu-boost \
-  --no-cpu-throttling \
+  "${BACKEND_FLAGS[@]}" \
   --port=8080 \
-  --set-env-vars="MCP_HOST=0.0.0.0,HYDRATE_CHROMA=1,GCS_CHROMA_BUCKET=${BUCKET},GCP_BACKUP_PROJECT=${PROJECT},CHROMA_DIR=/data/chroma_db,MCP_RATE_LIMIT_PER_MINUTE=60" \
-  --set-secrets="OPENAI_API_KEY=${SECRET_OPENAI}:latest,GOOGLE_API_KEY=${SECRET_GOOGLE}:latest,ASSEMBLYAI_API_KEY=${SECRET_ASSEMBLYAI}:latest"
+  --set-env-vars="${ENV_VARS}" \
+  --set-secrets="${SECRETS}"
 
 echo ">> Ensuring allUsers can invoke (public MCP)"
 gcloud run services add-iam-policy-binding "${SERVICE}" \
@@ -137,8 +213,9 @@ echo "URL:      ${URL}"
 echo "MCP:      ${URL}/mcp"
 echo "Health:   ${URL}/health"
 echo "Auth:     allUsers (unauthenticated)"
-echo "Min inst: 1"
-echo "Secrets:  ${SECRET_OPENAI}, ${SECRET_GOOGLE}, ${SECRET_ASSEMBLYAI}"
+echo "Backend:  ${KB_BACKEND} (search mode ${KB_SEARCH_MODE})"
+echo "Min inst: ${MIN_INSTANCES}"
+echo "Secrets:  ${RUNTIME_SECRETS[*]}"
 echo
 echo "Cursor mcp.json:"
 cat <<EOF
