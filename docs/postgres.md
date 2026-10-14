@@ -76,6 +76,10 @@ Nodes and relationships are streamed and written in batches (`--batch-size`, def
 
 Neither tool deletes anything in Chroma or Neo4j.
 
+## Serving it
+
+`src/database/pg_search.py` holds the read-only retrieval (keyword, vector, hybrid, graph templates). The MCP server uses it when deployed with `KB_BACKEND=postgres`; the tools, the eval comparison and the switch are in [mcp_server.md](mcp_server.md). Once `deploy_postgres_vm.sh` has created the DSN secret, `./scripts/deploy_ingest_job.sh` also gives the daily job `PG_DSN` and VPC egress (`INGEST_PG=0` opts out).
+
 ## Local development
 
 Any Postgres 16 with `vector` and `age` installed works, e.g. the same image:

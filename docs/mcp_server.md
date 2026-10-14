@@ -37,12 +37,18 @@ adapter = MCPAdapter("http://127.0.0.1:8000/mcp")
 
 ## Public tools
 
-Only two tools. Graph / Cypher stay off this surface (`query_knowledge_graph` remains a local LangChain `@tool` for CLIs only).
+The tools depend on `KB_BACKEND` (set by `./scripts/deploy_mcp.sh`):
 
-| Tool | Role |
-| --- | --- |
-| `search` | `query_summaries` + `query_segments` → typed `SearchResults` / `SourceChunk` |
-| `fetch` | Same helpers, filtered by `episode_id` or `doc_id` |
+| Tool | `chroma` (default) | `postgres` |
+| --- | --- | --- |
+| `search` | `query_summaries` + `query_segments` → typed `SearchResults` / `SourceChunk` | Same shape; ranking from `KB_SEARCH_MODE` (`vector` default, `keyword`, `hybrid`) |
+| `fetch` | Same helpers, filtered by `episode_id` or `doc_id` | Chunks of that `episode_id` / `doc_id`, transcript order |
+| `keyword_search` | not offered | Postgres full-text (`"phrase"`, `OR`, `-word`), ranked by `ts_rank_cd` |
+| `vector_search` | not offered | pgvector cosine similarity on the stored `text-embedding-3-small` vectors |
+| `hybrid_search` | not offered | keyword + vector fused with Reciprocal Rank Fusion (k=60) |
+| `graph_query` | not offered | Fixed templates over the AGE graph: `schema`, `find_entities`, `neighbors`, `connections` (1-3 hops), `mentions` |
+
+`graph_query` never takes query text: the caller picks a template and passes values (entity names, a label checked against the graph's own labels, hop count), which travel as bound parameters. Every Postgres connection is read-only (`default_transaction_read_only`) with a statement timeout (`PG_STATEMENT_TIMEOUT_MS`, default 5000), and the DSN uses the non-superuser app role. On the chroma backend, graph / Cypher stay off this surface (`query_knowledge_graph` remains a local LangChain `@tool` for CLIs only).
 
 Caps (TASK-18), env-overridable:
 
@@ -64,6 +70,14 @@ Agent and local chat UI are unchanged: they still use LangChain `@tool` wrappers
 
 ```bash
 uv run python -m evals.run
+```
+
+The same gold set runs against Postgres (needs `PG_DSN`, e.g. through the IAP tunnel in [postgres.md](postgres.md)). Compare these with the Chroma number before switching the public service:
+
+```bash
+uv run python -m evals.run --backend postgres --report evals/report_pg_vector.json
+uv run python -m evals.run --backend postgres --mode hybrid --report evals/report_pg_hybrid.json
+uv run python -m evals.run --backend postgres --mode keyword --report evals/report_pg_keyword.json
 ```
 
 ## Cloud Run (LearningFocus / us-west1)
@@ -115,3 +129,14 @@ Or:
 from langchain.mcp import MCPAdapter
 MCPAdapter("https://<service-url>/mcp")
 ```
+
+### Switching the service to Postgres
+
+After the Postgres VM is filled (see [postgres.md](postgres.md)) and the eval holds:
+
+```bash
+KB_BACKEND=postgres ./scripts/deploy_mcp.sh                       # search stays vector-ranked
+KB_BACKEND=postgres KB_SEARCH_MODE=hybrid ./scripts/deploy_mcp.sh # if hybrid scored better
+```
+
+On `postgres` the service skips the Chroma hydrate, reads `PG_DSN` from the `learningfocused-pg-dsn` secret, reaches the VM over Direct VPC egress (private ranges only), and defaults to 0 minimum instances with 1Gi and CPU throttling, which removes most of the always-on Cloud Run cost (override with `MCP_MIN_INSTANCES` / `MCP_MEMORY`). The daily job sees `KB_BACKEND=postgres` on the service and stops rolling it, since new chunks are visible as soon as they're synced. `KB_BACKEND=chroma ./scripts/deploy_mcp.sh` switches back.

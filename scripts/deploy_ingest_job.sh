@@ -2,6 +2,11 @@
 # Deploy the daily ingest Cloud Run Job + Cloud Scheduler (LearningFocus gen-lang-client-0304733057 / us-west1).
 # Separate from the public MCP service. Deploys to the LearningFocus project (same as .env GCP_PROJECT_ID).
 # Does not --reset-chroma, re-transcribe, wipe Neo4j, or scale MCP to zero.
+#
+# Postgres: once deploy_postgres_vm.sh has created the learningfocused-pg-dsn secret, the
+# job gets PG_DSN and Direct VPC egress, so it records feed state and copies Chroma into
+# Postgres each day. INGEST_PG=0 leaves Postgres out; INGEST_PG=1 requires it.
+# When the MCP service runs with KB_BACKEND=postgres the job doesn't roll it.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -20,6 +25,10 @@ SECRET_OPENAI="${SECRET_OPENAI:-learningfocused-openai-api-key}"
 SECRET_GOOGLE="${SECRET_GOOGLE:-learningfocused-google-api-key}"
 SECRET_ASSEMBLYAI="${SECRET_ASSEMBLYAI:-learningfocused-assemblyai-api-key}"
 EXECUTE_NOW="${EXECUTE_NOW:-0}"
+INGEST_PG="${INGEST_PG:-auto}"
+SECRET_DSN="${SECRET_PG_DSN:-learningfocused-pg-dsn}"
+NETWORK="${PG_NETWORK:-default}"
+SUBNET="${PG_SUBNET:-default}"
 
 gcloud config set project "${PROJECT}" >/dev/null
 
@@ -55,7 +64,27 @@ gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" \
   --role="roles/storage.objectAdmin" \
   --project="${PROJECT}" >/dev/null
 
-for secret in "${SECRET_OPENAI}" "${SECRET_GOOGLE}" "${SECRET_ASSEMBLYAI}"; do
+case "${INGEST_PG}" in
+  0) USE_PG=0 ;;
+  1|auto)
+    if gcloud secrets describe "${SECRET_DSN}" --project="${PROJECT}" >/dev/null 2>&1; then
+      USE_PG=1
+    elif [[ "${INGEST_PG}" == "1" ]]; then
+      echo "INGEST_PG=1 but secret ${SECRET_DSN} does not exist. Run ./scripts/deploy_postgres_vm.sh first." >&2
+      exit 1
+    else
+      USE_PG=0
+    fi
+    ;;
+  *) echo "INGEST_PG must be auto, 0 or 1 (got ${INGEST_PG})" >&2; exit 2 ;;
+esac
+
+JOB_SECRETS=("${SECRET_OPENAI}" "${SECRET_GOOGLE}" "${SECRET_ASSEMBLYAI}")
+if [[ "${USE_PG}" == "1" ]]; then
+  JOB_SECRETS+=("${SECRET_DSN}")
+fi
+
+for secret in "${JOB_SECRETS[@]}"; do
   echo ">> Granting secretAccessor on ${secret}"
   ok=0
   for _ in 1 2 3 4 5 6; do
@@ -110,7 +139,15 @@ gcloud iam service-accounts add-iam-policy-binding "${MCP_SA}" \
   --role="roles/iam.serviceAccountUser" \
   --project="${PROJECT}" >/dev/null
 
-echo ">> Deploying Cloud Run Job ${JOB} (${REGION})"
+SECRETS="OPENAI_API_KEY=${SECRET_OPENAI}:latest,GOOGLE_API_KEY=${SECRET_GOOGLE}:latest,ASSEMBLYAI_API_KEY=${SECRET_ASSEMBLYAI}:latest"
+if [[ "${USE_PG}" == "1" ]]; then
+  SECRETS+=",PG_DSN=${SECRET_DSN}:latest"
+  NETWORK_FLAGS=(--network="${NETWORK}" --subnet="${SUBNET}" --vpc-egress=private-ranges-only)
+else
+  NETWORK_FLAGS=(--clear-network)
+fi
+
+echo ">> Deploying Cloud Run Job ${JOB} (${REGION}, Postgres: $([[ "${USE_PG}" == "1" ]] && echo on || echo off))"
 gcloud run jobs deploy "${JOB}" \
   --quiet \
   --source "${ROOT}" \
@@ -124,8 +161,9 @@ gcloud run jobs deploy "${JOB}" \
   --max-retries=1 \
   --parallelism=1 \
   --tasks=1 \
+  "${NETWORK_FLAGS[@]}" \
   --set-env-vars="GCP_BACKUP_PROJECT=${PROJECT},GCS_CORPUS_BUCKET=${BUCKET},GCS_CHROMA_BUCKET=${BUCKET},MCP_SERVICE=${MCP_SERVICE},MCP_REGION=${REGION},HYDRATE_CHROMA=0,CHROMA_DIR=/app/chroma_db,DAILY_ART19_DOWNLOAD_LIMIT=5" \
-  --set-secrets="OPENAI_API_KEY=${SECRET_OPENAI}:latest,GOOGLE_API_KEY=${SECRET_GOOGLE}:latest,ASSEMBLYAI_API_KEY=${SECRET_ASSEMBLYAI}:latest"
+  --set-secrets="${SECRETS}"
 
 echo ">> Job is not public (no allUsers). Granting scheduler invoker on the job."
 gcloud run jobs add-iam-policy-binding "${JOB}" \
@@ -174,7 +212,8 @@ echo "SA:        ${SA_EMAIL}"
 echo "Scheduler: ${SCHEDULER_JOB}"
 echo "Schedule:  ${SCHEDULER_SCHEDULE} (${SCHEDULER_TZ})"
 echo "Target:    ${URI}"
-echo "MCP roll:  ${MCP_SERVICE} (min instances stay 1)"
+echo "MCP roll:  ${MCP_SERVICE} (chroma backend only; min instances stay >= 1)"
+echo "Postgres:  $([[ "${USE_PG}" == "1" ]] && echo "PG_DSN from ${SECRET_DSN}, VPC egress ${NETWORK}/${SUBNET}" || echo "not wired (no ${SECRET_DSN} secret or INGEST_PG=0)")"
 echo
 echo "Does not pull gs://${BUCKET}/podcast_downloads (6GB). Skip-existing uses hydrated transcripts."
 echo "A new RSS episode is downloaded + transcribed; existing files are not re-transcribed."

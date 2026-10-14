@@ -259,6 +259,14 @@ def _run_isolated(name: str, fn: SourceRunner) -> dict[str, Any]:
         }
 
 
+def mcp_backend(container: dict[str, Any]) -> str:
+    """The KB_BACKEND a Cloud Run container spec runs with (default chroma)."""
+    for item in container.get("env") or []:
+        if item.get("name") == "KB_BACKEND":
+            return str(item.get("value") or "chroma").strip().lower()
+    return "chroma"
+
+
 def roll_mcp_service(
     *,
     project: str | None = None,
@@ -266,7 +274,11 @@ def roll_mcp_service(
     service: str | None = None,
     snapshot_at: str,
 ) -> dict[str, Any]:
-    """Force a new MCP revision so hydrate re-runs. Does not scale to zero."""
+    """Force a new MCP revision so hydrate re-runs. Does not scale to zero.
+
+    Skipped when the service runs with KB_BACKEND=postgres: it reads Postgres live, so
+    there is no snapshot to reload (and it may run with zero minimum instances).
+    """
     import google.auth
     from google.auth.transport.requests import AuthorizedSession
 
@@ -289,6 +301,14 @@ def roll_mcp_service(
         raise RuntimeError(f"MCP GET {got.status_code}: {got.text[:2000]}")
     body = got.json()
 
+    containers = (body.get("template") or {}).get("containers") or []
+    if not containers:
+        raise RuntimeError(f"Service {service_id} has no containers")
+    if mcp_backend(containers[0]) == "postgres":
+        print(f"Not rolling {service_id}: it reads Postgres live (KB_BACKEND=postgres)")
+        return {"service": service_id, "region": region_id, "project": project_id, "skipped": True,
+                "reason": "KB_BACKEND=postgres reads live data"}
+
     scaling = (body.get("scaling") or {})
     template_scaling = (body.get("template") or {}).get("scaling") or {}
     min_count = scaling.get("minInstanceCount", template_scaling.get("minInstanceCount"))
@@ -301,9 +321,6 @@ def roll_mcp_service(
             f"Refusing to roll {service_id}: minInstanceCount={min_count!r} would scale MCP to zero"
         )
 
-    containers = (body.get("template") or {}).get("containers") or []
-    if not containers:
-        raise RuntimeError(f"Service {service_id} has no containers")
     env = list(containers[0].get("env") or [])
     found = False
     for item in env:

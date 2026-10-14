@@ -56,10 +56,12 @@ def _register_vector(conn: "psycopg.Connection") -> None:
         pass
 
 
-def connect(dsn: str | None = None, *, autocommit: bool = False) -> "psycopg.Connection":
+def connect(dsn: str | None = None, *, autocommit: bool = False, extra_options: str = "") -> "psycopg.Connection":
+    """Open a connection. `extra_options` adds startup settings (e.g. "-c statement_timeout=5000")."""
     import psycopg
 
-    conn = psycopg.connect(dsn or get_dsn(), autocommit=autocommit, options=_SESSION_OPTIONS)
+    options = f"{_SESSION_OPTIONS} {extra_options}".strip()
+    conn = psycopg.connect(dsn or get_dsn(), autocommit=autocommit, options=options)
     _register_vector(conn)
     return conn
 
