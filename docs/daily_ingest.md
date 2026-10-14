@@ -4,7 +4,7 @@ One Cloud Run **Job** (not the public MCP service) checks every feed in [`src/fe
 
 Does **not** `--reset-chroma`, re-transcribe existing files, take more than `max_new_per_run` new YouTube videos per run, ingest `@thealphaschool` / UU dumps / Shorts-tab dumps, wipe Neo4j, or scale the MCP service to zero. Graph/Neo4j is skipped in the job (no Docker/Aura on Cloud Run).
 
-Project is LearningFocus (`gen-lang-client-0304733057`, same as `.env` `GCP_PROJECT_ID`) / `us-west1`. Do not deploy to `inferpoker`; that project belongs to InferPoker.
+Project is LearningFocus (`gen-lang-client-0304733057`, the scripts' default; `GCP_BACKUP_PROJECT` overrides it, see `scripts/_gcp_env.sh`) / `us-west1`. Do not deploy to `inferpoker`; that project belongs to InferPoker.
 
 ## Entrypoint
 
