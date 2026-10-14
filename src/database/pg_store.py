@@ -156,7 +156,8 @@ def status(dsn: str | None = None) -> dict[str, object]:
             counts: dict[str, int] = {}
             for table in ("sources", "documents", "chunks", "ingest_runs"):
                 cur.execute(f"SELECT count(*) FROM {table}")  # noqa: S608 - fixed table names
-                counts[table] = int(cur.fetchone()[0])
+                row = cur.fetchone()
+                counts[table] = int(row[0]) if row else 0
     return {"extensions": extensions, "counts": counts}
 
 
