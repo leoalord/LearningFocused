@@ -1,0 +1,68 @@
+{
+  "_comment": "Every feed the daily job checks. Edit only this file; the Postgres `sources` table is a mirror that each run overwrites. cadence: daily | weekly | manual. The YouTube entry walks the @future_of_education Videos tab plus the 'MacKenzie Price Media Appearances' and 'About Gifted Minds' playlists (fixed in src/pipeline/youtube/run.py feed_listings). Social sources stay disabled until accounts and credentials are filled in.",
+  "sources": [
+    {
+      "key": "art19",
+      "kind": "podcast_rss",
+      "name": "Future of Education podcast (Art19)",
+      "url": "https://rss.art19.com/future-of-education",
+      "cadence": "daily",
+      "enabled": true,
+      "config": {"download_limit": 5}
+    },
+    {
+      "key": "substack",
+      "kind": "substack",
+      "name": "Future of Education Substack",
+      "url": "https://futureofeducation.substack.com/feed",
+      "cadence": "daily",
+      "enabled": true,
+      "config": {"ingest_limit": 10}
+    },
+    {
+      "key": "youtube",
+      "kind": "youtube_channel",
+      "name": "MacKenzie Price on YouTube (@future_of_education)",
+      "url": "https://www.youtube.com/@future_of_education/videos",
+      "cadence": "daily",
+      "enabled": true,
+      "config": {"max_new_per_run": 10}
+    },
+    {
+      "key": "instagram",
+      "kind": "instagram",
+      "name": "Instagram",
+      "url": null,
+      "cadence": "daily",
+      "enabled": false,
+      "config": {"accounts": [], "access": "graph_api", "credential_env": "INSTAGRAM_ACCESS_TOKEN"}
+    },
+    {
+      "key": "x",
+      "kind": "x",
+      "name": "X (Twitter)",
+      "url": null,
+      "cadence": "weekly",
+      "enabled": false,
+      "config": {"accounts": [], "credential_env": "X_BEARER_TOKEN"}
+    },
+    {
+      "key": "linkedin",
+      "kind": "linkedin",
+      "name": "LinkedIn",
+      "url": null,
+      "cadence": "weekly",
+      "enabled": false,
+      "config": {"accounts": [], "credential_env": "LINKEDIN_ACCESS_TOKEN"}
+    },
+    {
+      "key": "tiktok",
+      "kind": "tiktok",
+      "name": "TikTok",
+      "url": null,
+      "cadence": "weekly",
+      "enabled": false,
+      "config": {"accounts": [], "credential_env": "TIKTOK_ACCESS_TOKEN"}
+    }
+  ]
+}
