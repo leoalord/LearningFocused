@@ -48,6 +48,32 @@ Re-run `migrate --app-role` after any admin-side graph import: AGE adds a table 
 and the app role must own those tables to add more labels later.
 ```
 
+## Filling it: Chroma backfill, daily dual-write, Neo4j graph
+
+**Vectors and text (from Chroma, no re-embedding).** Chroma already stores the `text-embedding-3-small` vectors, so the backfill copies them as they are:
+
+```bash
+# with the IAP tunnel and PGPASSWORD from "Deploy" above, on a machine with chroma_db/
+PG_DSN=postgresql://learningfocused@localhost:6543/learningfocused \
+  uv run python -m src.database.pg_sync            # add --prune to delete chunks no longer in Chroma
+```
+
+It is idempotent: re-running rewrites only chunks whose text, metadata or vector changed. Each chunk keeps its Chroma id and `type`; `documents` gets one row per episode (`episode_id`), article or video (`doc_id`), or podcast series (`series:<group title>`), with `published_at` parsed from RSS, ISO or YouTube dates.
+
+**Daily dual-write.** Once the daily job has `PG_DSN`, it runs the same sync right after the sources (ledger: `pg_state.chroma_to_pg`). A Postgres failure is recorded and never fails ingest. Postgres then follows Chroma until the MCP server reads Postgres directly.
+
+**Graph (from the local Neo4j, any size).** Run on the Mac that has Neo4j, with the tunnel open:
+
+```bash
+NEO4J_URI=bolt://localhost:7687 NEO4J_USERNAME=neo4j NEO4J_PASSWORD=... \
+PG_DSN=postgresql://learningfocused@localhost:6543/learningfocused \
+  uv run python -m src.database.neo4j_to_age --grant-to learningfocused_app
+```
+
+Nodes and relationships are streamed and written in batches (`--batch-size`, default 1000), each batch in its own transaction. `age_import_map` records every copied Neo4j id, so an interrupted run is finished by running it again. The script prints Neo4j's counts next to what AGE holds and exits non-zero until they match. Each node gets one AGE label (its first label other than `__Entity__`) and keeps all its Neo4j labels in a `labels` property; `embedding` properties are dropped unless `--keep-property embedding`. `--grant-to` hands the new label tables to the app role so it can keep adding to the graph.
+
+Neither tool deletes anything in Chroma or Neo4j.
+
 ## Local development
 
 Any Postgres 16 with `vector` and `age` installed works, e.g. the same image:

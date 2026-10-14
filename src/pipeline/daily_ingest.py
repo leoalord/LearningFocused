@@ -164,6 +164,14 @@ def _pg_step(ledger: dict[str, Any], name: str, fn: Callable[[], Any]) -> Any:
     return result
 
 
+def sync_chroma_to_postgres() -> dict[str, Any]:
+    from dataclasses import asdict
+
+    from src.database.pg_sync import sync_from_chroma
+
+    return asdict(sync_from_chroma())
+
+
 def _load_registry(ledger: dict[str, Any]) -> tuple[list[SourceConfig], bool]:
     """(sources, is_fallback)."""
     try:
@@ -449,6 +457,13 @@ def run(
                 ledger["sources"][name] = {"ok": False, "error": f"unknown source {name}"}
             else:
                 ledger["sources"][name] = _run_isolated(name, fn)
+        persist_ledger(ledger, run_id, to_gcs=write_gcs)
+
+    if use_pg:
+        # Dual-write: Postgres follows Chroma (embeddings reused) until MCP reads Postgres.
+        stats = _pg_step(ledger, "chroma_to_pg", sync_chroma_to_postgres)
+        if stats is not None:
+            ledger["pg_state"]["chroma_to_pg"]["stats"] = stats
         persist_ledger(ledger, run_id, to_gcs=write_gcs)
 
     if sync and not dry_run:
