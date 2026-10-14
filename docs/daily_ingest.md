@@ -45,7 +45,7 @@ Every run writes:
 
 Fields: `started_at` / `finished_at`, per-source `ok` / `error`, hydrate counts, GCS upload stats, MCP revision after roll, `pg_state`.
 
-With `PG_DSN` set, the run also mirrors `sources.json` into the `sources` table, reads each source's last check (for weekly cadence), and writes `ingest_runs` + `source_checks`. Any Postgres error is recorded under `pg_state` and never fails the run. Until the job is given `PG_DSN` (with the MCP Postgres switch), weekly sources run on Mondays.
+With `PG_DSN` set, the run also mirrors `sources.json` into the `sources` table, reads each source's last check (for weekly cadence), and writes `ingest_runs` + `source_checks`. After the sources run it also copies new and changed Chroma chunks into Postgres and removes the ones Chroma no longer has (`pg_state.chroma_to_pg`, see [postgres.md](postgres.md)). Any Postgres error is recorded under `pg_state` and never fails the run. Until the job is given `PG_DSN` (with the MCP Postgres switch), weekly sources run on Mondays.
 
 ## Cloud Run Job
 

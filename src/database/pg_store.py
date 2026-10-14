@@ -92,8 +92,7 @@ def ensure_app_role(conn: "psycopg.Connection", role: str, password: str, graph:
     """Create/refresh the non-superuser role the app connects as.
 
     It gets DML on the public tables, read access to AGE's catalog, and ownership of the
-    graph's label tables: AGE creates a new label as a child table of the graph's base
-    tables, which only their owner may do. Re-run after an admin import adds labels.
+    graph's label tables (see grant_graph_ownership).
     """
     from psycopg import sql
 
@@ -119,15 +118,29 @@ def ensure_app_role(conn: "psycopg.Connection", role: str, password: str, graph:
             "GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA {g} TO {r}",
         ):
             cur.execute(sql.SQL(stmt).format(r=ident, g=sql.Identifier(graph)))
+    grant_graph_ownership(conn, role, graph)
+
+
+def grant_graph_ownership(conn: "psycopg.Connection", role: str, graph: str = GRAPH_NAME) -> None:
+    """Make `role` own every label table and sequence of the graph.
+
+    AGE adds a label as a child table of the graph's base tables, which only their owner
+    may do, so this runs again after an admin-side import creates new labels.
+    """
+    from psycopg import sql
+
+    with conn.cursor() as cur:
         cur.execute(
+            # Sequences owned by a label table (OWNED BY) follow their table automatically.
             "SELECT c.relname, c.relkind FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
-            "WHERE n.nspname = %s AND c.relkind IN ('r', 'S')",
+            "WHERE n.nspname = %s AND (c.relkind = 'r' OR (c.relkind = 'S' AND NOT EXISTS ("
+            "SELECT 1 FROM pg_depend d WHERE d.objid = c.oid AND d.deptype = 'a')))",
             (graph,),
         )
         for relname, relkind in cur.fetchall():
             kind = "TABLE" if relkind == "r" else "SEQUENCE"
             cur.execute(sql.SQL("ALTER " + kind + " {}.{} OWNER TO {}").format(
-                sql.Identifier(graph), sql.Identifier(relname), ident))
+                sql.Identifier(graph), sql.Identifier(relname), sql.Identifier(role)))
 
 
 def migrate(dsn: str | None = None, *, app_role: str | None = None,

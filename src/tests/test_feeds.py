@@ -123,6 +123,31 @@ class TestDailyIngestRegistry(unittest.TestCase):
         sync.assert_not_called()
         self.assertEqual(list(ledger["sources"]), ["art19", "substack", "youtube"])
 
+    def test_dual_write_runs_after_sources_and_is_non_fatal(self) -> None:
+        registry = [SourceConfig(key="art19", kind="podcast_rss", name="a")]
+        order: list[str] = []
+        with (
+            patch("src.feeds.state.is_enabled", return_value=True),
+            patch("src.feeds.state.sync_registry"),
+            patch("src.feeds.state.last_checked", return_value={}),
+            patch("src.feeds.state.record_run", return_value=True),
+            patch("src.pipeline.daily_ingest.sync_chroma_to_postgres",
+                  side_effect=lambda: order.append("pg") or {"chunks_written": 3}),
+        ):
+            ledger = self._run(registry=registry, source_runners={"art19": lambda: order.append("art19") or {}})
+        self.assertEqual(order, ["art19", "pg"])
+        self.assertEqual(ledger["pg_state"]["chroma_to_pg"], {"ok": True, "stats": {"chunks_written": 3}})
+        with (
+            patch("src.feeds.state.is_enabled", return_value=True),
+            patch("src.feeds.state.sync_registry"),
+            patch("src.feeds.state.last_checked", return_value={}),
+            patch("src.feeds.state.record_run", return_value=True),
+            patch("src.pipeline.daily_ingest.sync_chroma_to_postgres", side_effect=RuntimeError("pg down")),
+        ):
+            ledger = self._run(registry=registry, source_runners={"art19": lambda: {}})
+        self.assertTrue(ledger["sources"]["art19"]["ok"])
+        self.assertFalse(ledger["pg_state"]["chroma_to_pg"]["ok"])
+
     def test_due_selection_and_skip(self) -> None:
         registry = [
             SourceConfig(key="art19", kind="podcast_rss", name="a"),
