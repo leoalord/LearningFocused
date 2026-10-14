@@ -169,7 +169,9 @@ def sync_chroma_to_postgres() -> dict[str, Any]:
 
     from src.database.pg_sync import sync_from_chroma
 
-    return asdict(sync_from_chroma())
+    # Prune too, so chunks Chroma retired (re-segmented, id changes) leave Postgres; the
+    # sync skips the prune when Chroma looks incomplete and says so in the stats.
+    return asdict(sync_from_chroma(prune=True))
 
 
 def _load_registry(ledger: dict[str, Any]) -> tuple[list[SourceConfig], bool]:

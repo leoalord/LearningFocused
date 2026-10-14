@@ -4,7 +4,14 @@ from __future__ import annotations
 
 import unittest
 
-from src.database.neo4j_to_age import EdgeRow, NodeRow, age_name, node_properties, primary_label
+from src.database.neo4j_to_age import (
+    EdgeRow,
+    NodeRow,
+    age_name,
+    name_collisions,
+    node_properties,
+    primary_label,
+)
 from src.tests.pg_testutil import PG_TEST_DSN, SKIP_REASON, TempDatabase
 
 
@@ -14,6 +21,13 @@ class TestMapping(unittest.TestCase):
         self.assertEqual(primary_label(["__Entity__"]), "Entity")
         self.assertEqual(age_name("HAS-TOPIC", "R"), "HAS_TOPIC")
         self.assertEqual(age_name("__x", "R"), "x")
+
+    def test_name_collisions_are_caught_before_import(self) -> None:
+        self.assertEqual(name_collisions(["Person", "__Entity__", "IngestedDoc"], ["KNOWS"]), [])
+        problems = name_collisions(["Has-Topic", "Has_Topic", "Person"], ["PERSON_OF", "Person"])
+        self.assertEqual(len(problems), 2)
+        self.assertIn("'Has_Topic'", problems[0])
+        self.assertIn("'Person'", problems[1])
 
     def test_properties_keep_labels_and_drop_embeddings(self) -> None:
         import json

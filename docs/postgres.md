@@ -58,9 +58,11 @@ PG_DSN=postgresql://learningfocused@localhost:6543/learningfocused \
   uv run python -m src.database.pg_sync            # add --prune to delete chunks no longer in Chroma
 ```
 
-It is idempotent: re-running rewrites only chunks whose text, metadata or vector changed. Each chunk keeps its Chroma id and `type`; `documents` gets one row per episode (`episode_id`), article or video (`doc_id`), or podcast series (`series:<group title>`), with `published_at` parsed from RSS, ISO or YouTube dates.
+It is idempotent: each page of Chroma rows is compared with Postgres first (text, metadata, document), and vectors are read from Chroma only for new or changed chunks. Each chunk keeps its Chroma id and `type`. `documents` gets one row per podcast episode (`podcast:<episode id>_<title hash>`, the same key the Chroma ids use, because the feed reuses episode numbers; the bare `episode_id` is in `documents.metadata`), article or video (`doc_id`), or podcast series (`series:<group title>`), with `published_at` parsed from RSS, ISO or YouTube dates. Placeholder ids and titles ("unknown", "Unknown Title") never become a document or replace a real title.
 
-**Daily dual-write.** Once the daily job has `PG_DSN`, it runs the same sync right after the sources (ledger: `pg_state.chroma_to_pg`). A Postgres failure is recorded and never fails ingest. Postgres then follows Chroma until the MCP server reads Postgres directly.
+`--prune` deletes chunks that are no longer in Chroma (Chroma's `--prune-stale-chroma` runs remove rows after re-segmenting or id changes) and documents left with no chunks. It is skipped, and the command exits 1, when Chroma is empty or the prune would delete more than 10% of chunks (`--max-prune-fraction`), since that points to an incomplete Chroma copy rather than retired content.
+
+**Daily dual-write.** Once the daily job has `PG_DSN`, it runs the same sync with prune right after the sources (ledger: `pg_state.chroma_to_pg`, whose stats include `prune_skipped` when the 10% guard held a prune back). A Postgres failure is recorded and never fails ingest. Postgres then follows Chroma, deletes included, until the MCP server reads Postgres directly.
 
 **Graph (from the local Neo4j, any size).** Run on the Mac that has Neo4j, with the tunnel open:
 
@@ -70,7 +72,7 @@ PG_DSN=postgresql://learningfocused@localhost:6543/learningfocused \
   uv run python -m src.database.neo4j_to_age --grant-to learningfocused_app
 ```
 
-Nodes and relationships are streamed and written in batches (`--batch-size`, default 1000), each batch in its own transaction. `age_import_map` records every copied Neo4j id, so an interrupted run is finished by running it again. The script prints Neo4j's counts next to what AGE holds and exits non-zero until they match. Each node gets one AGE label (its first label other than `__Entity__`) and keeps all its Neo4j labels in a `labels` property; `embedding` properties are dropped unless `--keep-property embedding`. `--grant-to` hands the new label tables to the app role so it can keep adding to the graph.
+Nodes and relationships are streamed and written in batches (`--batch-size`, default 1000), each batch in its own transaction. `age_import_map` records every copied Neo4j `elementId`, so an interrupted run is finished by running it again. Don't change the Neo4j graph between an interrupted run and its re-run: Neo4j can reuse ids of deleted items, and a reused id would be taken as already copied. The script prints Neo4j's counts next to what AGE holds and exits non-zero until they match; relationships whose end nodes were not imported are reported separately, since re-running can't fix those. `IngestedDoc` bookkeeping nodes (and their relationships) are skipped. Before writing, it checks that no two Neo4j labels or relationship types reduce to the same AGE name. Each node gets one AGE label (its first label other than `__Entity__`) and keeps all its Neo4j labels in a `labels` property; `embedding` properties are dropped unless `--keep-property embedding`. `--grant-to` hands the new label tables to the app role so it can keep adding to the graph.
 
 Neither tool deletes anything in Chroma or Neo4j.
 

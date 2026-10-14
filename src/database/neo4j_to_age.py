@@ -2,8 +2,10 @@
 
 Works at any graph size: nodes and relationships are streamed from Neo4j (no full load
 into memory) and written to Postgres in batches, each in its own transaction. It can be
-stopped and re-run: `age_import_map` remembers every Neo4j id already copied, so a
-re-run only adds what is missing. It never deletes anything in Neo4j or Postgres.
+stopped and re-run: `age_import_map` remembers every Neo4j `elementId` already copied,
+so a re-run only adds what is missing. Leave the Neo4j graph unchanged between an
+interrupted run and its re-run, because Neo4j may reuse the ids of deleted items. It
+never deletes anything in Neo4j or Postgres.
 
 Run it from the machine that has Neo4j (Leo's Mac), with Postgres reachable through the
 IAP tunnel (docs/postgres.md) and the admin DSN:
@@ -13,9 +15,12 @@ IAP tunnel (docs/postgres.md) and the admin DSN:
       uv run python -m src.database.neo4j_to_age --grant-to learningfocused_app
 
 Mapping: each node gets one AGE label (its first label other than `__Entity__`;
-AGE allows one) and keeps all Neo4j labels in a `labels` property plus its Neo4j id in
-`neo4j_id`. Relationship types map to AGE edge labels. Names are reduced to
-[A-Za-z0-9_] (AGE reserves a leading underscore).
+AGE allows one) and keeps all Neo4j labels in a `labels` property plus its Neo4j
+elementId in `neo4j_id`. Relationship types map to AGE edge labels. Names are reduced to
+[A-Za-z0-9_] (AGE reserves a leading underscore); the import refuses to start if two
+names would reduce to the same AGE label. `IngestedDoc` nodes are the indexer's
+bookkeeping (which source documents were processed), not knowledge, so they and their
+relationships are skipped.
 """
 
 from __future__ import annotations
@@ -35,10 +40,12 @@ if TYPE_CHECKING:
 
 DEFAULT_BATCH_SIZE = 1000
 IGNORED_LABELS = {"__Entity__", "__KGBuilder__"}
+# Nodes with these labels are not copied (src/pipeline/index_neo4j.py bookkeeping).
+SKIPPED_LABELS = ("IngestedDoc",)
 DEFAULT_DROP_PROPERTIES = ("embedding",)
 MAP_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS age_import_map (
-    nid text PRIMARY KEY,           -- 'n:<neo4j id>' or 'e:<neo4j id>'
+    nid text PRIMARY KEY,           -- 'n:<neo4j elementId>' or 'e:<neo4j elementId>'
     gid ag_catalog.graphid NOT NULL
 )
 """
@@ -80,6 +87,26 @@ def primary_label(labels: list[str]) -> str:
         if label not in IGNORED_LABELS:
             return age_name(label, "Entity")
     return "Entity"
+
+
+def name_collisions(labels: Iterable[str], rel_types: Iterable[str]) -> list[str]:
+    """Problems that would make two Neo4j names share one AGE label, as readable lines."""
+    problems = []
+    vertex: dict[str, set[str]] = {}
+    for label in labels:
+        if label not in IGNORED_LABELS and label not in SKIPPED_LABELS:
+            vertex.setdefault(age_name(label, "Entity"), set()).add(label)
+    edge: dict[str, set[str]] = {}
+    for rel_type in rel_types:
+        edge.setdefault(age_name(rel_type, "RELATED_TO"), set()).add(rel_type)
+    for kind, names in (("node labels", vertex), ("relationship types", edge)):
+        for target, sources in sorted(names.items()):
+            if len(sources) > 1:
+                problems.append(f"{kind} {sorted(sources)} all become AGE label {target!r}")
+    for target in sorted(set(vertex) & set(edge)):
+        problems.append(f"node label {sorted(vertex[target])} and relationship type "
+                        f"{sorted(edge[target])} both become AGE label {target!r}")
+    return problems
 
 
 def _jsonable(value: Any) -> Any:
@@ -250,8 +277,15 @@ def import_graph(
     return stats
 
 
+_NODE_FILTER = "none(l IN labels(n) WHERE l IN $skip)"
+_EDGE_FILTER = "none(l IN labels(a) + labels(b) WHERE l IN $skip)"
+
+
 def read_neo4j(batch_size: int) -> tuple[Iterator[NodeRow], Iterator[EdgeRow], Any]:
-    """Streaming readers over the Neo4j in NEO4J_URI/USERNAME/PASSWORD. Returns (nodes, edges, driver)."""
+    """Streaming readers over the Neo4j in NEO4J_URI/USERNAME/PASSWORD. Returns (nodes, edges, driver).
+
+    Keyed by elementId(), the stable successor of the deprecated id().
+    """
     from neo4j import GraphDatabase
 
     driver = GraphDatabase.driver(
@@ -260,14 +294,20 @@ def read_neo4j(batch_size: int) -> tuple[Iterator[NodeRow], Iterator[EdgeRow], A
 
     def nodes() -> Iterator[NodeRow]:
         with driver.session(fetch_size=batch_size) as session:
-            result = session.run("MATCH (n) RETURN id(n) AS nid, labels(n) AS labels, properties(n) AS props")
+            result = session.run(
+                f"MATCH (n) WHERE {_NODE_FILTER} "
+                "RETURN elementId(n) AS nid, labels(n) AS labels, properties(n) AS props",
+                skip=list(SKIPPED_LABELS),
+            )
             for rec in result:
                 yield NodeRow(str(rec["nid"]), list(rec["labels"]), dict(rec["props"]))
 
     def edges() -> Iterator[EdgeRow]:
         with driver.session(fetch_size=batch_size) as session:
             result = session.run(
-                "MATCH (a)-[r]->(b) RETURN id(r) AS rid, type(r) AS type, id(a) AS s, id(b) AS e, properties(r) AS props"
+                f"MATCH (a)-[r]->(b) WHERE {_EDGE_FILTER} RETURN elementId(r) AS rid, type(r) AS type, "
+                "elementId(a) AS s, elementId(b) AS e, properties(r) AS props",
+                skip=list(SKIPPED_LABELS),
             )
             for rec in result:
                 yield EdgeRow(str(rec["rid"]), str(rec["type"]), str(rec["s"]), str(rec["e"]), dict(rec["props"]))
@@ -276,10 +316,20 @@ def read_neo4j(batch_size: int) -> tuple[Iterator[NodeRow], Iterator[EdgeRow], A
 
 
 def neo4j_counts(driver: Any) -> dict[str, int]:
+    """What the import should copy (bookkeeping nodes excluded, as in read_neo4j)."""
+    skip = list(SKIPPED_LABELS)
     with driver.session() as session:
-        n = session.run("MATCH (n) RETURN count(n) AS c").single()["c"]
-        r = session.run("MATCH ()-[r]->() RETURN count(r) AS c").single()["c"]
+        n = session.run(f"MATCH (n) WHERE {_NODE_FILTER} RETURN count(n) AS c", skip=skip).single()["c"]
+        r = session.run(f"MATCH (a)-[r]->(b) WHERE {_EDGE_FILTER} RETURN count(r) AS c", skip=skip).single()["c"]
     return {"nodes": int(n), "relationships": int(r)}
+
+
+def neo4j_names(driver: Any) -> tuple[list[str], list[str]]:
+    with driver.session() as session:
+        labels = [r["label"] for r in session.run("CALL db.labels() YIELD label RETURN label")]
+        types = [r["relationshipType"] for r in session.run(
+            "CALL db.relationshipTypes() YIELD relationshipType RETURN relationshipType")]
+    return labels, types
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -297,6 +347,12 @@ def main(argv: list[str] | None = None) -> int:
 
     nodes, edges, driver = read_neo4j(args.batch_size)
     try:
+        problems = name_collisions(*neo4j_names(driver))
+        if problems:
+            print("Not importing: these Neo4j names would share an AGE label. Rename them in Neo4j first.")
+            for problem in problems:
+                print(f"  {problem}")
+            return 2
         expected = neo4j_counts(driver)
         print(f"Neo4j: {expected}")
         drop = [d for d in DEFAULT_DROP_PROPERTIES if d not in set(args.keep_property)]
@@ -312,8 +368,11 @@ def main(argv: list[str] | None = None) -> int:
             pg_store.grant_graph_ownership(conn, args.grant_to)
     print(json.dumps(asdict(stats), indent=2))
     print(f"AGE now holds {mapped_nodes} of {expected['nodes']} nodes and {mapped_edges} of {expected['relationships']} relationships.")
+    if stats.edges_missing_endpoint:
+        print(f"{stats.edges_missing_endpoint} relationships point at nodes that were not imported "
+              "(the graph changed during the import?). Re-running won't add them.")
     complete = mapped_nodes >= expected["nodes"] and mapped_edges >= expected["relationships"]
-    if not complete:
+    if mapped_nodes < expected["nodes"] or mapped_edges + stats.edges_missing_endpoint < expected["relationships"]:
         print("Incomplete: re-run to copy the rest (already-copied items are skipped).")
     return 0 if complete else 1
 
