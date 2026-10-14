@@ -32,7 +32,7 @@ LangChain consumer (same protocol, client role):
 from langchain.mcp import MCPAdapter
 
 adapter = MCPAdapter("http://127.0.0.1:8000/mcp")
-# Cloud Run: MCPAdapter("https://learningfocused-mcp-920577997010.us-west1.run.app/mcp")
+# Cloud Run: MCPAdapter("<service URL>/mcp")
 ```
 
 ## Public tools
@@ -66,22 +66,21 @@ Agent and local chat UI are unchanged: they still use LangChain `@tool` wrappers
 uv run python -m evals.run
 ```
 
-## Cloud Run (inferpoker / us-west1)
+## Cloud Run (LearningFocus / us-west1)
 
-One GCP project: **inferpoker**. Do **not** deploy to `.env` `GCP_PROJECT_ID=gen-lang-client-0304733057`.
+One GCP project: LearningFocus (`gen-lang-client-0304733057`, the scripts' default; `GCP_BACKUP_PROJECT` overrides it, see `scripts/_gcp_env.sh`). Do **not** deploy to `inferpoker`; that project belongs to InferPoker.
 
 | | |
 | --- | --- |
 | Service | `learningfocused-mcp` |
 | Region | `us-west1` |
-| Project | `inferpoker` |
-| HTTPS MCP | `https://learningfocused-mcp-920577997010.us-west1.run.app/mcp` |
-| Alternate URL | `https://learningfocused-mcp-z2rzib77rq-uw.a.run.app/mcp` |
-| Health | `https://learningfocused-mcp-920577997010.us-west1.run.app/health` |
+| Project | `gen-lang-client-0304733057` |
+| HTTPS MCP | `<service URL>/mcp` (printed by `./scripts/deploy_mcp.sh`) |
+| Health | `<service URL>/health` |
 | Auth | Public unauthenticated (`allUsers` `roles/run.invoker`) |
 | Warm | `--min-instances=1`, `--no-cpu-throttling` |
 | Memory | 2Gi / 1 CPU |
-| Vectors | Hydrate `gs://inferpoker-learningfocused/chroma_db/` onto `/data/chroma_db` at startup; `get_vector_store()` still uses local `CHROMA_DIR` |
+| Vectors | Hydrate `gs://learningfocused-corpus/chroma_db/` onto `/data/chroma_db` at startup; `get_vector_store()` still uses local `CHROMA_DIR` |
 
 Secret Manager (values never committed):
 
@@ -89,7 +88,7 @@ Secret Manager (values never committed):
 - `learningfocused-google-api-key` → `GOOGLE_API_KEY`
 - `learningfocused-assemblyai-api-key` → `ASSEMBLYAI_API_KEY`
 
-Runtime SA `learningfocused-mcp@inferpoker.iam.gserviceaccount.com` has `roles/storage.objectViewer` on the private bucket and `roles/secretmanager.secretAccessor` on those secrets.
+Runtime SA `learningfocused-mcp@gen-lang-client-0304733057.iam.gserviceaccount.com` has `roles/storage.objectViewer` on the private bucket and `roles/secretmanager.secretAccessor` on those secrets.
 
 ```bash
 ./scripts/deploy_mcp.sh
@@ -102,8 +101,7 @@ The daily ingest **job** (`learningfocused-ingest`) is a separate Cloud Run Job.
 Smoke the public endpoint (Streamable HTTP initialize):
 
 ```bash
-URL="$(gcloud run services describe learningfocused-mcp --region=us-west1 --project=inferpoker --format='value(status.url)')"
-# currently: https://learningfocused-mcp-920577997010.us-west1.run.app
+URL="$(gcloud run services describe learningfocused-mcp --region=us-west1 --project=gen-lang-client-0304733057 --format='value(status.url)')"
 curl -sS -D - -o /tmp/mcp-init.out \
   -X POST "${URL}/mcp" \
   -H 'Content-Type: application/json' \

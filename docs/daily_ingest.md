@@ -1,10 +1,10 @@
 # Daily ingest (TASK-19)
 
-One Cloud Run **Job** (not the public MCP service) walks Art19 RSS, Substack, and unique YouTube every day. Failures are isolated per source. A run ledger is written every time. After ingest, derived artifacts + `chroma_db/` are checksum-synced to `gs://inferpoker-learningfocused`, then `learningfocused-mcp` is rolled so warm instances rehydrate.
+One Cloud Run **Job** (not the public MCP service) walks Art19 RSS, Substack, and unique YouTube every day. Failures are isolated per source. A run ledger is written every time. After ingest, derived artifacts + `chroma_db/` are checksum-synced to `gs://learningfocused-corpus`, then `learningfocused-mcp` is rolled so warm instances rehydrate.
 
 Does **not** `--reset-chroma`, re-transcribe existing files, raise the YouTube V1 cap, ingest `@thealphaschool` / UU dumps / Shorts-tab dumps, wipe Neo4j, or scale the MCP service to zero. Graph/Neo4j is skipped in the job (no Docker/Aura on Cloud Run).
 
-Project is **inferpoker** / `us-west1`. Do not deploy to `.env` `GCP_PROJECT_ID=gen-lang-client-0304733057`.
+Project is LearningFocus (`gen-lang-client-0304733057`, the scripts' default; `GCP_BACKUP_PROJECT` overrides it, see `scripts/_gcp_env.sh`) / `us-west1`. Do not deploy to `inferpoker`; that project belongs to InferPoker.
 
 ## Entrypoint
 
@@ -35,8 +35,8 @@ Audio download skips an MP3 when the matching transcript already exists, so the 
 Every run writes:
 
 - local `ingest_ledger/<run_id>.json` and `ingest_ledger/latest.json`
-- `gs://inferpoker-learningfocused/ingest_ledger/<run_id>.json`
-- `gs://inferpoker-learningfocused/ingest_ledger/latest.json`
+- `gs://learningfocused-corpus/ingest_ledger/<run_id>.json`
+- `gs://learningfocused-corpus/ingest_ledger/latest.json`
 
 Fields: `started_at` / `finished_at`, per-source `ok` / `error`, hydrate counts, GCS upload stats, MCP revision after roll.
 
@@ -46,7 +46,7 @@ Fields: `started_at` / `finished_at`, per-source `ok` / `error`, hydrate counts,
 | --- | --- |
 | Job | `learningfocused-ingest` |
 | Region | `us-west1` |
-| Runtime SA | `learningfocused-ingest@inferpoker.iam.gserviceaccount.com` |
+| Runtime SA | `learningfocused-ingest@gen-lang-client-0304733057.iam.gserviceaccount.com` |
 | Memory / CPU | 8 Gi / 2 |
 | Task timeout | 4 hours (new episode = AssemblyAI + embeddings) |
 | Auth | Not public. Scheduler OAuth / `roles/run.invoker` only |
@@ -75,7 +75,7 @@ Then pipelines run with skip-existing. Then checksum upload of those prefixes. T
 | Name | `learningfocused-ingest-daily` |
 | Schedule | `0 8 * * *` |
 | Timezone | `America/Los_Angeles` (08:00 Pacific) |
-| Target | `POST https://run.googleapis.com/v2/projects/inferpoker/locations/us-west1/jobs/learningfocused-ingest:run` |
+| Target | `POST https://run.googleapis.com/v2/projects/gen-lang-client-0304733057/locations/us-west1/jobs/learningfocused-ingest:run` |
 | Auth | OAuth as `learningfocused-ingest@…` |
 | State | `ENABLED` |
 
@@ -90,7 +90,7 @@ The ingest SA also needs `roles/artifactregistry.reader` on `cloud-run-source-de
 Confirm:
 
 ```bash
-gcloud artifacts repositories get-iam-policy cloud-run-source-deploy --location=us-west1 --project=inferpoker
+gcloud artifacts repositories get-iam-policy cloud-run-source-deploy --location=us-west1 --project=gen-lang-client-0304733057
 ```
 
 ## “New RSS episode without a laptop”
@@ -100,7 +100,7 @@ The job cannot wait for S E357. Structural proof:
 1. Art19 `download.py` skips existing transcripts and only downloads titles that are not already transcribed.
 2. Cloud Run Job executions walk all three sources with skip-existing (no `--force`, no `--reset-chroma`, no 6 GiB audio pull). Scheduler run `learningfocused-ingest-75gz8` was created at 08:00 America/Los_Angeles by `learningfocused-ingest@` (not a laptop `gcloud`).
 3. Scheduler `learningfocused-ingest-daily` is ENABLED, `0 8 * * *` America/Los_Angeles, targeting the job `:run` API.
-4. After Artifact Registry reader was applied on `cloud-run-source-deploy`, job execution `learningfocused-ingest-ctwxh` (runtime SA `learningfocused-ingest@`) wrote `mcp_roll.ok: true` and minted revision `learningfocused-mcp-00004-lhp` with `serving.knative.dev/creator: learningfocused-ingest@inferpoker.iam.gserviceaccount.com` and `minScale=1`. Public `/health` 200 and unauthenticated `/mcp` still work.
+4. (Proof from the original `inferpoker` deployment, before the move to LearningFocus.) After Artifact Registry reader was applied on `cloud-run-source-deploy`, job execution `learningfocused-ingest-ctwxh` (runtime SA `learningfocused-ingest@`) wrote `mcp_roll.ok: true` and minted revision `learningfocused-mcp-00004-lhp` with `serving.knative.dev/creator: learningfocused-ingest@inferpoker.iam.gserviceaccount.com` and `minScale=1`. Public `/health` 200 and unauthenticated `/mcp` still work.
 
 When E357 (or any new Art19 item) appears in the RSS feed, the next 08:00 Pacific run downloads that one MP3, transcribes it, upserts Chroma, uploads the snapshot, and rolls MCP — no laptop session required.
 

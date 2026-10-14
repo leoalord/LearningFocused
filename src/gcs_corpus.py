@@ -26,8 +26,8 @@ ARTIFACT_PREFIXES = (
 )
 
 LEDGER_PREFIX = "ingest_ledger"
-DEFAULT_BUCKET = "inferpoker-learningfocused"
-DEFAULT_PROJECT = "inferpoker"
+DEFAULT_BUCKET = "learningfocused-corpus"
+DEFAULT_PROJECT = "gen-lang-client-0304733057"
 _EXCLUDE_NAMES = {".DS_Store"}
 _DOWNLOAD_WORKERS = 8
 

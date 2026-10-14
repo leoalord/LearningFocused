@@ -13,8 +13,6 @@ ENV UV_COMPILE_BYTECODE=1 \
     PYTHONPATH=/app \
     MCP_HOST=0.0.0.0 \
     HYDRATE_CHROMA=1 \
-    GCS_CHROMA_BUCKET=inferpoker-learningfocused \
-    GCP_BACKUP_PROJECT=inferpoker \
     CHROMA_DIR=/data/chroma_db \
     PORT=8080
 

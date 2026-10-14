@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
-# Deploy the daily ingest Cloud Run Job + Cloud Scheduler (inferpoker / us-west1).
-# Separate from the public MCP service. Does not deploy to GCP_PROJECT_ID from .env.
+# Deploy the daily ingest Cloud Run Job + Cloud Scheduler (LearningFocus gen-lang-client-0304733057 / us-west1).
+# Separate from the public MCP service. Deploys to the LearningFocus project (same as .env GCP_PROJECT_ID).
 # Does not --reset-chroma, re-transcribe, wipe Neo4j, or scale MCP to zero.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
 
-PROJECT="${GCP_BACKUP_PROJECT:-inferpoker}"
-REGION="${GCP_REGION:-us-west1}"
+source "$(dirname "${BASH_SOURCE[0]}")/_gcp_env.sh"
 JOB="${CLOUD_RUN_JOB:-learningfocused-ingest}"
 SCHEDULER_JOB="${CLOUD_SCHEDULER_JOB:-learningfocused-ingest-daily}"
 SCHEDULER_SCHEDULE="${CLOUD_SCHEDULER_SCHEDULE:-0 8 * * *}"
@@ -17,7 +16,6 @@ SA_NAME="${INGEST_SA:-learningfocused-ingest}"
 SA_EMAIL="${SA_NAME}@${PROJECT}.iam.gserviceaccount.com"
 MCP_SA="${CLOUD_RUN_SA:-learningfocused-mcp}@${PROJECT}.iam.gserviceaccount.com"
 MCP_SERVICE="${MCP_SERVICE:-learningfocused-mcp}"
-BUCKET="${GCS_CORPUS_BUCKET:-inferpoker-learningfocused}"
 SECRET_OPENAI="${SECRET_OPENAI:-learningfocused-openai-api-key}"
 SECRET_GOOGLE="${SECRET_GOOGLE:-learningfocused-google-api-key}"
 SECRET_ASSEMBLYAI="${SECRET_ASSEMBLYAI:-learningfocused-assemblyai-api-key}"
