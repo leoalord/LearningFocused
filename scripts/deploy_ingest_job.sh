@@ -62,6 +62,7 @@ echo ">> Granting ${SA_EMAIL} objectAdmin on gs://${BUCKET} (job writes artifact
 gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" \
   --member="serviceAccount:${SA_EMAIL}" \
   --role="roles/storage.objectAdmin" \
+  --condition=None \
   --project="${PROJECT}" >/dev/null
 
 case "${INGEST_PG}" in
