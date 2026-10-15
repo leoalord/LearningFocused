@@ -45,6 +45,12 @@ unset PGPASSWORD PG_APP_PASSWORD PG_READER_PASSWORD
 ./scripts/pg_backup.sh dump-now          # first backup; also proves the VM can write to the bucket
 ./scripts/pg_backup.sh restore-test      # gate: the GCS copy restores into a scratch database and Cypher works
 
+If `start-iap-tunnel` hangs at "Testing if tunnel connection works", forward the port over
+IAP SSH instead (same localhost:6543). Long imports can outlive one IAP session; the
+graph import resumes where it stopped, but end any session left "idle in transaction".
+gcloud compute ssh learningfocused-pg --zone=us-west1-b --project=gen-lang-client-0304733057 \
+  --tunnel-through-iap -- -N -L 6543:localhost:5432 -o ServerAliveInterval=15 &
+
 Re-run `migrate --app-role --reader-role` after any admin-side graph import: AGE adds a table
 per new label, the app role must own those tables to add more labels later, and the reader
 role needs SELECT on them.

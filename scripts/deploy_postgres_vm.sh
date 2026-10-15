@@ -83,7 +83,14 @@ gcloud artifacts repositories add-iam-policy-binding "${AR_REPO}" --location="${
 gcloud secrets add-iam-policy-binding "${SECRET_PASSWORD}" \
   --member="serviceAccount:${SA_EMAIL}" --role="roles/secretmanager.secretAccessor" --project="${PROJECT}" >/dev/null
 gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" \
-  --member="serviceAccount:${SA_EMAIL}" --role="roles/storage.objectCreator" --project="${PROJECT}" >/dev/null
+  --member="serviceAccount:${SA_EMAIL}" --role="roles/storage.objectCreator" --condition=None \
+  --project="${PROJECT}" >/dev/null
+# `gcloud storage cp` reads the destination object's metadata, and restore-test downloads the
+# dump onto the VM, so the VM also needs read access, but only under pg_dumps/.
+gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" \
+  --member="serviceAccount:${SA_EMAIL}" --role="roles/storage.objectViewer" \
+  --condition="expression=resource.name.startsWith(\"projects/_/buckets/${BUCKET}/objects/pg_dumps/\"),title=pg-dumps-read" \
+  --project="${PROJECT}" >/dev/null
 if [[ -z "$(gcloud storage buckets describe "gs://${BUCKET}" --project="${PROJECT}" --format='value(lifecycle_config)')" ]]; then
   echo ">> Bucket lifecycle: delete pg_dumps/ objects after 30 days"
   LIFECYCLE="$(mktemp)"

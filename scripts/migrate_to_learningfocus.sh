@@ -56,12 +56,15 @@ if ! pause_out="$(gcloud scheduler jobs pause learningfocused-ingest-daily \
     exit 1
   fi
 fi
+# Keep stderr out of ${running}: with no executions gcloud still warns there (e.g. "filter keys
+# were not present"), and that text must not read as a running execution.
+exec_err="$(mktemp)"
 if ! running="$(gcloud run jobs executions list --job=learningfocused-ingest --region="${REGION}" \
-    --project="${OLD_PROJECT}" --filter='NOT status.completionTime:*' --format='value(name)' 2>&1)"; then
-  if grep -qiE 'NOT_FOUND|not found' <<<"${running}"; then
+    --project="${OLD_PROJECT}" --filter='NOT status.completionTime:*' --format='value(name)' 2>"${exec_err}")"; then
+  if grep -qiE 'NOT_FOUND|not found' "${exec_err}"; then
     running=""
   else
-    echo "${running}" >&2
+    cat "${exec_err}" >&2
     echo "Could not check for running old ingest executions; not copying." >&2
     exit 1
   fi
