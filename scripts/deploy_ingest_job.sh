@@ -25,7 +25,7 @@ SECRET_OPENAI="${SECRET_OPENAI:-learningfocused-openai-api-key}"
 SECRET_GOOGLE="${SECRET_GOOGLE:-learningfocused-google-api-key}"
 SECRET_ASSEMBLYAI="${SECRET_ASSEMBLYAI:-learningfocused-assemblyai-api-key}"
 # The LLM fallback chains build every listed model up front, so a missing key for any
-# fallback (Haiku, the Fireworks DeepSeek) fails the step even when Gemini would answer.
+# fallback (Claude, Fireworks-hosted models) fails the step even when Gemini would answer.
 SECRET_ANTHROPIC="${SECRET_ANTHROPIC:-learningfocused-anthropic-api-key}"
 SECRET_FIREWORKS="${SECRET_FIREWORKS:-learningfocused-fireworks-api-key}"
 EXECUTE_NOW="${EXECUTE_NOW:-0}"
