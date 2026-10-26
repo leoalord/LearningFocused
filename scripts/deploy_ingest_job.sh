@@ -24,6 +24,10 @@ MCP_SERVICE="${MCP_SERVICE:-learningfocused-mcp}"
 SECRET_OPENAI="${SECRET_OPENAI:-learningfocused-openai-api-key}"
 SECRET_GOOGLE="${SECRET_GOOGLE:-learningfocused-google-api-key}"
 SECRET_ASSEMBLYAI="${SECRET_ASSEMBLYAI:-learningfocused-assemblyai-api-key}"
+# The LLM fallback chains build every listed model up front, so a missing key for any
+# fallback (Haiku, the Fireworks DeepSeek) fails the step even when Gemini would answer.
+SECRET_ANTHROPIC="${SECRET_ANTHROPIC:-learningfocused-anthropic-api-key}"
+SECRET_FIREWORKS="${SECRET_FIREWORKS:-learningfocused-fireworks-api-key}"
 EXECUTE_NOW="${EXECUTE_NOW:-0}"
 INGEST_PG="${INGEST_PG:-auto}"
 SECRET_DSN="${SECRET_PG_DSN:-learningfocused-pg-dsn}"
@@ -80,7 +84,7 @@ case "${INGEST_PG}" in
   *) echo "INGEST_PG must be auto, 0 or 1 (got ${INGEST_PG})" >&2; exit 2 ;;
 esac
 
-JOB_SECRETS=("${SECRET_OPENAI}" "${SECRET_GOOGLE}" "${SECRET_ASSEMBLYAI}")
+JOB_SECRETS=("${SECRET_OPENAI}" "${SECRET_GOOGLE}" "${SECRET_ASSEMBLYAI}" "${SECRET_ANTHROPIC}" "${SECRET_FIREWORKS}")
 if [[ "${USE_PG}" == "1" ]]; then
   JOB_SECRETS+=("${SECRET_DSN}")
 fi
@@ -141,6 +145,7 @@ gcloud iam service-accounts add-iam-policy-binding "${MCP_SA}" \
   --project="${PROJECT}" >/dev/null
 
 SECRETS="OPENAI_API_KEY=${SECRET_OPENAI}:latest,GOOGLE_API_KEY=${SECRET_GOOGLE}:latest,ASSEMBLYAI_API_KEY=${SECRET_ASSEMBLYAI}:latest"
+SECRETS+=",ANTHROPIC_API_KEY=${SECRET_ANTHROPIC}:latest,FIREWORKS_API_KEY=${SECRET_FIREWORKS}:latest"
 if [[ "${USE_PG}" == "1" ]]; then
   SECRETS+=",PG_DSN=${SECRET_DSN}:latest"
   NETWORK_FLAGS=(--network="${NETWORK}" --subnet="${SUBNET}" --vpc-egress=private-ranges-only)
