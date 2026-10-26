@@ -77,20 +77,27 @@ if ! gcloud iam service-accounts describe "${SA_EMAIL}" --project="${PROJECT}" >
   gcloud iam service-accounts create "${SA_NAME}" --display-name="LearningFocused Postgres VM" --project="${PROJECT}"
   sleep 10
 fi
-echo ">> Granting the VM: image pull, password read, dump upload"
+echo ">> Granting the VM: image pull, password read, dump upload and read"
 gcloud artifacts repositories add-iam-policy-binding "${AR_REPO}" --location="${REGION}" \
   --member="serviceAccount:${SA_EMAIL}" --role="roles/artifactregistry.reader" --project="${PROJECT}" >/dev/null
 gcloud secrets add-iam-policy-binding "${SECRET_PASSWORD}" \
   --member="serviceAccount:${SA_EMAIL}" --role="roles/secretmanager.secretAccessor" --project="${PROJECT}" >/dev/null
+# --condition=None on every bucket binding: once the policy holds a conditional binding,
+# gcloud refuses (or prompts for) unconditional adds.
 gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" \
-  --member="serviceAccount:${SA_EMAIL}" --role="roles/storage.objectCreator" --condition=None \
-  --project="${PROJECT}" >/dev/null
-# `gcloud storage cp` reads the destination object's metadata, and restore-test downloads the
-# dump onto the VM, so the VM also needs read access, but only under pg_dumps/.
+  --member="serviceAccount:${SA_EMAIL}" --role="roles/storage.objectCreator" --project="${PROJECT}" \
+  --condition=None >/dev/null
+# `gcloud storage cp` resolves the destination with an objects.get and then an objects.list on
+# the dump's name. Reads are limited to pg_dumps/ so the VM can't read the corpus. Listing is
+# checked against the bucket and Cloud Storage role conditions can't match a list prefix, so
+# the VM gets legacyBucketReader: it can see object names, not their contents.
 gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" \
-  --member="serviceAccount:${SA_EMAIL}" --role="roles/storage.objectViewer" \
+  --member="serviceAccount:${SA_EMAIL}" --role="roles/storage.objectViewer" --project="${PROJECT}" \
   --condition="expression=resource.name.startsWith(\"projects/_/buckets/${BUCKET}/objects/pg_dumps/\"),title=pg-dumps-read" \
-  --project="${PROJECT}" >/dev/null
+  >/dev/null
+gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" \
+  --member="serviceAccount:${SA_EMAIL}" --role="roles/storage.legacyBucketReader" --project="${PROJECT}" \
+  --condition=None >/dev/null
 if [[ -z "$(gcloud storage buckets describe "gs://${BUCKET}" --project="${PROJECT}" --format='value(lifecycle_config)')" ]]; then
   echo ">> Bucket lifecycle: delete pg_dumps/ objects after 30 days"
   LIFECYCLE="$(mktemp)"
