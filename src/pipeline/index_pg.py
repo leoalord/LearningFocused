@@ -270,6 +270,9 @@ def update_pg_index(
     """
     from src.database import pg_store
 
+    if not dry_run:
+        require_postgres(dsn)
+
     stats = IndexStats(dry_run=dry_run)
     unreadable = unreadable if unreadable is not None else []
     if documents is None:

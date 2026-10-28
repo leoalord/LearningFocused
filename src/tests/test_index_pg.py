@@ -141,6 +141,14 @@ class TestRequirePostgres(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "cannot write chunks/documents"):
                 require_postgres(reader)
 
+            embed = FakeEmbedder()
+            with self.assertRaisesRegex(RuntimeError, "cannot write chunks/documents"):
+                update_pg_index(dsn=reader, embed=embed, documents=_corpus())
+            self.assertEqual(embed.calls, [])
+            dry = update_pg_index(dsn=reader, embed=embed, documents=_corpus(), dry_run=True)
+            self.assertEqual(dry.embedded, len(_corpus()))
+            self.assertEqual(embed.calls, [])
+
 
 @unittest.skipUnless(PG_TEST_DSN, SKIP_REASON)
 class TestUpdatePgIndex(unittest.TestCase):

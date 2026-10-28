@@ -39,9 +39,9 @@ adapter = MCPAdapter("http://127.0.0.1:8000/mcp")
 
 The tools depend on `KB_BACKEND` (set by `./scripts/deploy_mcp.sh`):
 
-| Tool | `chroma` (default) | `postgres` |
+| Tool | `chroma` (legacy local backend) | `postgres` (deploy default) |
 | --- | --- | --- |
-| `search` | `query_summaries` + `query_segments` → typed `SearchResults` / `SourceChunk` | Same shape; ranking from `KB_SEARCH_MODE` (`vector` default, `keyword`, `hybrid`) |
+| `search` | `query_summaries` + `query_segments` → typed `SearchResults` / `SourceChunk` | Same shape; ranking from `KB_SEARCH_MODE` (`hybrid` deploy default; `vector` and `keyword` also supported) |
 | `fetch` | Same helpers, filtered by `episode_id` or `doc_id` | Chunks of that `episode_id` / `doc_id`, transcript order |
 | `keyword_search` | not offered | Postgres full-text (`"phrase"`, `OR`, `-word`), ranked by `ts_rank_cd` |
 | `vector_search` | not offered | pgvector cosine similarity on the stored `text-embedding-3-small` vectors |
@@ -135,8 +135,8 @@ MCPAdapter("https://<service-url>/mcp")
 After the Postgres VM is filled (see [postgres.md](postgres.md)) and the eval holds:
 
 ```bash
-KB_BACKEND=postgres ./scripts/deploy_mcp.sh                       # search stays vector-ranked
-KB_BACKEND=postgres KB_SEARCH_MODE=hybrid ./scripts/deploy_mcp.sh # if hybrid scored better
+./scripts/deploy_mcp.sh                       # Postgres, hybrid ranking, min instances 0, 1Gi
+KB_SEARCH_MODE=vector ./scripts/deploy_mcp.sh # explicitly select vector ranking
 ```
 
 On `postgres` the service:
