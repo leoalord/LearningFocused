@@ -126,7 +126,6 @@ class TestDailyIngestIsolation(unittest.TestCase):
                     sources=("art19", "substack", "youtube"),
                     hydrate=False,
                     sync=False,
-                    roll=False,
                     dry_run=False,
                     source_runners={"art19": art19, "substack": substack, "youtube": youtube},
                 )
@@ -152,7 +151,6 @@ class TestDailyIngestIsolation(unittest.TestCase):
                     sources=("art19", "substack"),
                     hydrate=False,
                     sync=False,
-                    roll=False,
                     source_runners={"art19": boom, "substack": boom},
                 )
             files = list(ledger_dir.glob("*.json"))
@@ -176,7 +174,6 @@ class TestDailyIngestIsolation(unittest.TestCase):
                     sources=("art19",),
                     hydrate=True,
                     sync=False,
-                    roll=False,
                     source_runners={"art19": art19},
                 )
         self.assertEqual(called, [])
@@ -196,7 +193,6 @@ class TestDailyIngestIsolation(unittest.TestCase):
                     sources=("art19",),
                     hydrate=False,
                     sync=False,
-                    roll=False,
                     dry_run=True,
                     source_runners={"art19": art19},
                 )

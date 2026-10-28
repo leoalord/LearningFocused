@@ -110,7 +110,7 @@ Runtime SA `learningfocused-mcp@gen-lang-client-0304733057.iam.gserviceaccount.c
 
 Hydrate is `python -m src.mcp_server.hydrate` in `scripts/mcp_entrypoint.sh`. It copies the snapshot; it does not `--reset-chroma`.
 
-The daily ingest **job** (`learningfocused-ingest`) is a separate Cloud Run Job. After it updates `chroma_db/` in GCS it rolls this service (`CHROMA_SNAPSHOT_AT`) so warm instances rehydrate. It does not scale MCP to zero. See `docs/daily_ingest.md`.
+The daily ingest **job** (`learningfocused-ingest`) is a separate Cloud Run Job. It writes new chunks straight into Postgres, which this service reads live, so it no longer rolls the service. See `docs/daily_ingest.md`.
 
 Smoke the public endpoint (Streamable HTTP initialize):
 
@@ -145,4 +145,4 @@ On `postgres` the service:
 - opens at most 4 connections per instance (`PG_MAX_CONNECTIONS`) and takes 8 requests per instance (`MCP_CONCURRENCY`), with 5s connect and statement timeouts; database errors reach clients as a short "busy / unavailable" message, never with hosts or roles;
 - defaults to 0 minimum instances with 1Gi and CPU throttling, which removes most of the always-on Cloud Run cost (override with `MCP_MIN_INSTANCES` / `MCP_MEMORY`). The trade-off is a cold start of a few seconds on the first request after it has been idle.
 
-The daily job sees `KB_BACKEND=postgres` on the service and stops rolling it, since new chunks are visible as soon as they're synced; the run is marked failed if the job has no `PG_DSN` or the Chroma → Postgres copy failed, so a stale service doesn't go unnoticed. `deploy_mcp.sh` also warns when the job isn't wired to Postgres. `KB_BACKEND=chroma ./scripts/deploy_mcp.sh` switches back.
+`./scripts/deploy_mcp.sh` now defaults to `KB_BACKEND=postgres KB_SEARCH_MODE=hybrid` (what the live service runs) and refuses `KB_BACKEND=chroma`: the daily job writes Postgres only, so the Chroma snapshot no longer gets new content. It still warns when the job isn't wired to Postgres.

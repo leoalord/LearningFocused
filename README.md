@@ -82,7 +82,7 @@ See deeper docs: `src/pipeline/substack/README.md`.
 One command / job walks Art19 + Substack + unique YouTube without aborting the whole run. See `docs/daily_ingest.md`.
 
 ```bash
-uv run python -m src.pipeline.daily_ingest --dry-run --skip-hydrate --skip-sync --skip-roll
+uv run python -m src.pipeline.daily_ingest --dry-run --skip-hydrate --skip-sync
 ./scripts/deploy_ingest_job.sh
 ```
 

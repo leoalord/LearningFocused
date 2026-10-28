@@ -27,6 +27,8 @@ if TYPE_CHECKING:
 SCHEMA_PATH = Path(__file__).with_name("pg_schema.sql")
 GRAPH_NAME = "knowledge"
 EMBEDDING_DIMS = 1536
+# Chunks and queries must be embedded with the same model; EMBEDDING_DIMS is its size.
+EMBEDDING_MODEL = "text-embedding-3-small"
 APP_ROLE_DEFAULT = "learningfocused_app"
 READER_ROLE_DEFAULT = "learningfocused_mcp"
 # Max MCP connections: 3 Cloud Run instances x PG_MAX_CONNECTIONS (4) plus headroom, so

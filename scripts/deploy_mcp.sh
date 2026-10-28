@@ -3,14 +3,12 @@
 # Deploys to the LearningFocus project (same as GCP_PROJECT_ID in .env).
 # Does not --reset-chroma, re-transcribe, or touch the podcast_downloads rsync.
 #
-# KB_BACKEND picks the store the server reads:
-#   chroma (default)  hydrate the Chroma snapshot from GCS at boot; min 1 instance, 2Gi.
-#   postgres          read the Postgres VM live over Direct VPC egress as the read-only
-#                     learningfocused_mcp role (PG_DSN from the learningfocused-pg-dsn-reader
-#                     secret, made by deploy_postgres_vm.sh); adds the keyword/vector/hybrid/
-#                     graph tools; no hydrate, so it scales to zero (first request after idle
-#                     pays a cold start of a few seconds).
-# Roll back to Chroma at any time with KB_BACKEND=chroma ./scripts/deploy_mcp.sh.
+# The server reads the Postgres VM live over Direct VPC egress as the read-only
+# learningfocused_mcp role (PG_DSN from the learningfocused-pg-dsn-reader secret, made by
+# deploy_postgres_vm.sh), with the keyword/vector/hybrid/graph tools. No hydrate, so it
+# scales to zero (the first request after idle pays a cold start of a few seconds).
+# KB_BACKEND=chroma is refused: the daily job writes Postgres only, so the Chroma snapshot
+# in GCS no longer gets new content.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -26,8 +24,8 @@ SECRET_GOOGLE="${SECRET_GOOGLE:-learningfocused-google-api-key}"
 SECRET_ASSEMBLYAI="${SECRET_ASSEMBLYAI:-learningfocused-assemblyai-api-key}"
 ENV_FILE="${ROOT}/.env"
 UPDATE_SECRETS="${UPDATE_SECRETS:-0}"
-KB_BACKEND="${KB_BACKEND:-chroma}"
-KB_SEARCH_MODE="${KB_SEARCH_MODE:-vector}"
+KB_BACKEND="${KB_BACKEND:-postgres}"
+KB_SEARCH_MODE="${KB_SEARCH_MODE:-hybrid}"
 SECRET_DSN="${SECRET_PG_READER_DSN:-learningfocused-pg-dsn-reader}"
 INGEST_JOB="${CLOUD_RUN_JOB:-learningfocused-ingest}"
 NETWORK="${PG_NETWORK:-default}"
@@ -35,9 +33,8 @@ SUBNET="${PG_SUBNET:-default}"
 
 case "${KB_BACKEND}" in
   chroma)
-    MIN_INSTANCES="${MCP_MIN_INSTANCES:-1}"
-    MEMORY="${MCP_MEMORY:-2Gi}"
-    CONCURRENCY="${MCP_CONCURRENCY:-80}"
+    echo "KB_BACKEND=chroma is no longer supported: ingest writes Postgres only, so the Chroma snapshot is stale." >&2
+    exit 2
     ;;
   postgres)
     MIN_INSTANCES="${MCP_MIN_INSTANCES:-0}"
@@ -47,7 +44,7 @@ case "${KB_BACKEND}" in
     CONCURRENCY="${MCP_CONCURRENCY:-8}"
     ;;
   *)
-    echo "KB_BACKEND must be chroma or postgres (got ${KB_BACKEND})" >&2
+    echo "KB_BACKEND must be postgres (got ${KB_BACKEND})" >&2
     exit 2
     ;;
 esac
@@ -145,7 +142,7 @@ if [[ "${KB_BACKEND}" == "postgres" ]]; then
     exit 1
   fi
   RUNTIME_SECRETS+=("${SECRET_DSN}")
-  # The service only sees new content through the daily job's Chroma -> Postgres copy.
+  # The service only sees new content through the daily job's Postgres writes.
   if ! gcloud run jobs describe "${INGEST_JOB}" --region="${REGION}" --project="${PROJECT}" \
       --format=json 2>/dev/null | grep -q '"PG_DSN"'; then
     echo "WARNING: ${INGEST_JOB} has no PG_DSN, so Postgres won't get new content." >&2

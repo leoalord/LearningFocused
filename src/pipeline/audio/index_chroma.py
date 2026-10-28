@@ -160,7 +160,7 @@ def collect_audio_documents(unreadable: List[str] | None = None) -> List[Documen
 
     # Combined summaries
     if COMBINED_DIR.exists():
-        for filename in os.listdir(COMBINED_DIR):
+        for filename in sorted(os.listdir(COMBINED_DIR)):
             if filename.endswith(".json") and not filename.startswith("episode_groupings"):
                 path = os.path.join(COMBINED_DIR, filename)
                 try:
@@ -173,7 +173,7 @@ def collect_audio_documents(unreadable: List[str] | None = None) -> List[Documen
 
     # Segmented transcripts
     if SEGMENTED_DIR.exists():
-        for filename in os.listdir(SEGMENTED_DIR):
+        for filename in sorted(os.listdir(SEGMENTED_DIR)):
             if filename.endswith(".json"):
                 path = os.path.join(SEGMENTED_DIR, filename)
                 try:

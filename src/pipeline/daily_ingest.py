@@ -4,11 +4,11 @@ One entrypoint checks every feed in the registry (src/feeds/sources.json) that i
 due today: Art19 podcast RSS, Substack, the whole @future_of_education YouTube
 channel (new uploads, deduplicated against podcast episodes), and social accounts
 once they are configured. Per-source failures are isolated: one raising does not
-abort the others. Every run writes a ledger (local + GCS) and, when PG_DSN is set,
-rows in ingest_runs / source_checks. After ingest, artifacts + chroma_db are
-checksum-synced to the private bucket and the public MCP Cloud Run service is rolled
-so warm instances rehydrate. Neo4j is skipped. Existing files are not re-transcribed.
-The MCP service is not scaled to zero.
+abort the others. Each source pipeline embeds its new and changed chunks straight
+into Postgres (src.pipeline.index_pg), where the MCP service reads them live, so the
+job needs PG_DSN. Every run writes a ledger (local + GCS) and rows in ingest_runs /
+source_checks. After ingest, the text artifacts are checksum-synced to the private
+bucket. Neo4j is skipped. Existing files are not re-transcribed.
 """
 
 from __future__ import annotations
@@ -41,12 +41,9 @@ from src.gcs_corpus import (
 SOURCE_ART19 = "art19"
 SOURCE_SUBSTACK = "substack"
 SOURCE_YOUTUBE = "youtube"
-MCP_SERVICE_DEFAULT = "learningfocused-mcp"
-MCP_REGION_DEFAULT = "us-west1"
 DEFAULT_ART19_DOWNLOAD_LIMIT = 5
 DEFAULT_SUBSTACK_INGEST_LIMIT = 10
 DEFAULT_YOUTUBE_MAX_NEW = 10
-CHROMA_SNAPSHOT_ENV = "CHROMA_SNAPSHOT_AT"
 
 SourceRunner = Callable[[], dict[str, Any]]
 
@@ -64,7 +61,7 @@ def _run_id(ts: datetime) -> str:
 
 
 def run_art19(download_limit: int = DEFAULT_ART19_DOWNLOAD_LIMIT) -> dict[str, Any]:
-    """Art19 / podcast RSS. Skip Neo4j. Do not --reset-chroma."""
+    """Art19 / podcast RSS. Skip Neo4j."""
     from src.pipeline.audio.run import main as audio_main
 
     limit = os.getenv("DAILY_ART19_DOWNLOAD_LIMIT", str(download_limit))
@@ -75,7 +72,7 @@ def run_art19(download_limit: int = DEFAULT_ART19_DOWNLOAD_LIMIT) -> dict[str, A
 
 
 def run_substack(ingest_limit: int = DEFAULT_SUBSTACK_INGEST_LIMIT) -> dict[str, Any]:
-    """Substack daily ingest. Skip Neo4j. Do not --reset-chroma."""
+    """Substack daily ingest. Skip Neo4j."""
     from src.pipeline.substack.run import main as substack_main
 
     argv = ["--skip-neo4j", "--", "--mode", "daily", "--ingest-limit", str(ingest_limit)]
@@ -87,7 +84,7 @@ def run_substack(ingest_limit: int = DEFAULT_SUBSTACK_INGEST_LIMIT) -> dict[str,
 def run_youtube(max_new: int = DEFAULT_YOUTUBE_MAX_NEW) -> dict[str, Any]:
     """Whole-channel YouTube feed (videos tab + two playlists) with skip.py dedupe.
 
-    No --force. No --reset-chroma. At most `max_new` new videos per run. Any video that
+    No --force. At most `max_new` new videos per run. Any video that
     fails marks this source failed (it is retried on later runs, up to youtube.run's
     FEED_MAX_ATTEMPTS), so failures show up in the ledger and in source_checks.
     """
@@ -162,16 +159,6 @@ def _pg_step(ledger: dict[str, Any], name: str, fn: Callable[[], Any]) -> Any:
         return None
     ledger["pg_state"][name] = {"ok": True}
     return result
-
-
-def sync_chroma_to_postgres() -> dict[str, Any]:
-    from dataclasses import asdict
-
-    from src.database.pg_sync import sync_from_chroma
-
-    # Prune too, so chunks Chroma retired (re-segmented, id changes) leave Postgres; the
-    # sync skips the prune when Chroma looks incomplete and says so in the stats.
-    return asdict(sync_from_chroma(prune=True))
 
 
 def _load_registry(ledger: dict[str, Any]) -> tuple[list[SourceConfig], bool]:
@@ -259,131 +246,12 @@ def _run_isolated(name: str, fn: SourceRunner) -> dict[str, Any]:
         }
 
 
-def mcp_backend(container: dict[str, Any]) -> str:
-    """The KB_BACKEND a Cloud Run container spec runs with (default chroma)."""
-    for item in container.get("env") or []:
-        if item.get("name") == "KB_BACKEND":
-            return str(item.get("value") or "chroma").strip().lower()
-    return "chroma"
-
-
-def roll_mcp_service(
-    *,
-    project: str | None = None,
-    region: str | None = None,
-    service: str | None = None,
-    snapshot_at: str,
-) -> dict[str, Any]:
-    """Force a new MCP revision so hydrate re-runs. Does not scale to zero.
-
-    Skipped when the service runs with KB_BACKEND=postgres: it reads Postgres live, so
-    there is no snapshot to reload (and it may run with zero minimum instances).
-    """
-    import google.auth
-    from google.auth.transport.requests import AuthorizedSession
-
-    project_id = project or default_project()
-    region_id = region or os.getenv("MCP_REGION") or os.getenv("GCP_REGION") or MCP_REGION_DEFAULT
-    service_id = (
-        service
-        or os.getenv("MCP_SERVICE")
-        or os.getenv("CLOUD_RUN_SERVICE")
-        or MCP_SERVICE_DEFAULT
-    )
-
-    credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
-    if hasattr(credentials, "with_quota_project"):
-        credentials = credentials.with_quota_project(project_id)
-    session = AuthorizedSession(credentials)
-    url = f"https://run.googleapis.com/v2/projects/{project_id}/locations/{region_id}/services/{service_id}"
-    got = session.get(url, timeout=60)
-    if not got.ok:
-        raise RuntimeError(f"MCP GET {got.status_code}: {got.text[:2000]}")
-    body = got.json()
-
-    containers = (body.get("template") or {}).get("containers") or []
-    if not containers:
-        raise RuntimeError(f"Service {service_id} has no containers")
-    if mcp_backend(containers[0]) == "postgres":
-        print(f"Not rolling {service_id}: it reads Postgres live (KB_BACKEND=postgres)")
-        return {"service": service_id, "region": region_id, "project": project_id, "skipped": True,
-                "reason": "KB_BACKEND=postgres reads live data"}
-
-    scaling = (body.get("scaling") or {})
-    template_scaling = (body.get("template") or {}).get("scaling") or {}
-    min_count = scaling.get("minInstanceCount", template_scaling.get("minInstanceCount"))
-    try:
-        min_n = int(min_count) if min_count is not None else 1
-    except (TypeError, ValueError):
-        min_n = 1
-    if min_n < 1:
-        raise RuntimeError(
-            f"Refusing to roll {service_id}: minInstanceCount={min_count!r} would scale MCP to zero"
-        )
-
-    env = list(containers[0].get("env") or [])
-    found = False
-    for item in env:
-        if item.get("name") == CHROMA_SNAPSHOT_ENV:
-            item["value"] = snapshot_at
-            item.pop("valueSource", None)
-            found = True
-            break
-    if not found:
-        env.append({"name": CHROMA_SNAPSHOT_ENV, "value": snapshot_at})
-    containers[0]["env"] = env
-
-    patch = {"template": {"containers": containers}}
-    patched = session.patch(
-        url,
-        params={"updateMask": "template.containers"},
-        json=patch,
-        timeout=120,
-    )
-    if not patched.ok:
-        raise RuntimeError(f"MCP PATCH {patched.status_code}: {patched.text[:2000]}")
-    operation = patched.json()
-    op_name = operation.get("name")
-    if op_name and not operation.get("done"):
-        _wait_run_operation(session, op_name, timeout_s=600)
-
-    refreshed = session.get(url, timeout=60)
-    refreshed.raise_for_status()
-    latest = refreshed.json()
-    revision = latest.get("latestReadyRevision") or latest.get("latestCreatedRevision")
-    print(f"Rolled {service_id}: latestReadyRevision={revision} {CHROMA_SNAPSHOT_ENV}={snapshot_at}")
-    return {
-        "service": service_id,
-        "region": region_id,
-        "project": project_id,
-        "revision": revision,
-        "snapshot_at": snapshot_at,
-        "min_instance_count": min_n,
-    }
-
-
-def _wait_run_operation(session: Any, op_name: str, *, timeout_s: int) -> None:
-    url = f"https://run.googleapis.com/v2/{op_name}" if not str(op_name).startswith("http") else op_name
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        resp = session.get(url, timeout=60)
-        resp.raise_for_status()
-        payload = resp.json()
-        if payload.get("done"):
-            if payload.get("error"):
-                raise RuntimeError(f"Cloud Run operation failed: {payload['error']}")
-            return
-        time.sleep(5)
-    raise TimeoutError(f"Timed out waiting for {op_name}")
-
-
 def run(
     *,
     sources: Sequence[str] | None = None,
     skip: Sequence[str] = (),
     hydrate: bool = True,
     sync: bool = True,
-    roll: bool = True,
     dry_run: bool = False,
     source_runners: dict[str, SourceRunner] | None = None,
     registry: list[SourceConfig] | None = None,
@@ -414,7 +282,6 @@ def run(
         "hydrate": None,
         "sources": {},
         "gcs_sync": None,
-        "mcp_roll": None,
         "pg_state": {},
         "errors": [],
     }
@@ -478,13 +345,6 @@ def run(
                 ledger["sources"][name] = _run_isolated(name, fn)
         persist_ledger(ledger, run_id, to_gcs=write_gcs)
 
-    if use_pg:
-        # Dual-write: Postgres follows Chroma (embeddings reused) until MCP reads Postgres.
-        stats = _pg_step(ledger, "chroma_to_pg", sync_chroma_to_postgres)
-        if stats is not None:
-            ledger["pg_state"]["chroma_to_pg"]["stats"] = stats
-        persist_ledger(ledger, run_id, to_gcs=write_gcs)
-
     if sync and not dry_run:
         try:
             ledger["gcs_sync"] = {"ok": True, "prefixes": upload_artifacts()}
@@ -500,36 +360,8 @@ def run(
     persist_ledger(ledger, run_id, to_gcs=write_gcs)
 
     sync_ok = bool(ledger.get("gcs_sync") and ledger["gcs_sync"].get("ok"))
-    if roll and not dry_run and sync_ok:
-        try:
-            ledger["mcp_roll"] = {
-                "ok": True,
-                **roll_mcp_service(snapshot_at=run_id),
-            }
-            if ledger["mcp_roll"].get("skipped"):
-                # A Postgres-backed MCP only sees today's content through the Chroma ->
-                # Postgres copy, so without it the service is silently stale.
-                copied = use_pg and bool((ledger["pg_state"].get("chroma_to_pg") or {}).get("ok"))
-                if not copied:
-                    reason = ("MCP reads Postgres but this job has no PG_DSN" if not use_pg
-                              else "MCP reads Postgres but the Chroma -> Postgres copy failed")
-                    ledger["mcp_roll"].update(ok=False, reason=reason)
-                    ledger["errors"].append(f"mcp_roll: {reason}")
-                    print(f"MCP not updated: {reason}")
-        except Exception as exc:  # noqa: BLE001
-            ledger["mcp_roll"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-            ledger["errors"].append(f"mcp_roll: {exc}")
-            print(f"MCP roll failed: {exc}")
-    elif dry_run:
-        ledger["mcp_roll"] = {"ok": True, "dry_run": True}
-    elif not sync_ok:
-        ledger["mcp_roll"] = {"ok": False, "skipped": True, "reason": "gcs_sync_failed"}
-    else:
-        ledger["mcp_roll"] = {"ok": True, "skipped": True}
-
     source_ok = all(bool((ledger["sources"].get(n) or {}).get("ok")) for n in wanted)
-    roll_ok = bool(ledger.get("mcp_roll") and ledger["mcp_roll"].get("ok"))
-    ledger["ok"] = bool(source_ok and sync_ok and roll_ok and (ledger.get("hydrate") or {}).get("ok"))
+    ledger["ok"] = bool(source_ok and sync_ok and (ledger.get("hydrate") or {}).get("ok"))
     ledger["finished_at"] = _iso(_utc_now())
     if use_pg:
         _pg_step(ledger, "record_run", lambda: feed_state.record_run(ledger))
@@ -543,14 +375,13 @@ def run(
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="python -m src.pipeline.daily_ingest",
-        description="Check every due feed in src/feeds/sources.json (isolated), then GCS sync + MCP roll.",
+        description="Check every due feed in src/feeds/sources.json (isolated), then GCS sync.",
     )
     p.add_argument("--source", action="append", dest="only", metavar="KEY",
                    help="Run only this registry key, due or not (repeatable).")
-    p.add_argument("--dry-run", action="store_true", help="Walk sources without calling pipelines, GCS, or MCP roll.")
-    p.add_argument("--skip-hydrate", action="store_true", help="Do not pull chroma/artifacts from GCS (local laptop).")
-    p.add_argument("--skip-sync", action="store_true", help="Do not upload artifacts/chroma to GCS.")
-    p.add_argument("--skip-roll", action="store_true", help="Do not roll the public MCP Cloud Run service.")
+    p.add_argument("--dry-run", action="store_true", help="Walk sources without calling pipelines or GCS.")
+    p.add_argument("--skip-hydrate", action="store_true", help="Do not pull artifacts from GCS (local laptop).")
+    p.add_argument("--skip-sync", action="store_true", help="Do not upload artifacts to GCS.")
     p.add_argument("--skip-art19", action="store_true")
     p.add_argument("--skip-substack", action="store_true")
     p.add_argument("--skip-youtube", action="store_true")
@@ -573,7 +404,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         skip=skip,
         hydrate=not args.skip_hydrate,
         sync=not args.skip_sync,
-        roll=not args.skip_roll,
         dry_run=args.dry_run,
     )
     if args.dry_run:

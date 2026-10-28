@@ -1,8 +1,8 @@
 # Daily ingest (TASK-19)
 
-One Cloud Run **Job** (not the public MCP service) checks every feed in [`src/feeds/sources.json`](feeds.md) that is due: Art19 RSS, Substack and the whole `@future_of_education` YouTube channel daily, social accounts once configured. Failures are isolated per source. A run ledger is written every time. After ingest, derived artifacts + `chroma_db/` are checksum-synced to `gs://learningfocused-corpus`, then `learningfocused-mcp` is rolled so warm instances rehydrate.
+One Cloud Run **Job** (not the public MCP service) checks every feed in [`src/feeds/sources.json`](feeds.md) that is due: Art19 RSS, Substack and the whole `@future_of_education` YouTube channel daily, social accounts once configured. Failures are isolated per source. Each source embeds its new and changed chunks straight into Postgres (`src/pipeline/index_pg.py`), where `learningfocused-mcp` reads them live, so the job needs `PG_DSN`. A run ledger is written every time. After ingest, the derived text artifacts are checksum-synced to `gs://learningfocused-corpus`. Chroma is no longer written; the old `chroma_db/` snapshot in the bucket is left as it was.
 
-Does **not** `--reset-chroma`, re-transcribe existing files, take more than `max_new_per_run` new YouTube videos per run, ingest `@thealphaschool` / UU dumps / Shorts-tab dumps, wipe Neo4j, or scale the MCP service to zero. Graph/Neo4j is skipped in the job (no Docker/Aura on Cloud Run).
+Does **not** re-transcribe existing files, take more than `max_new_per_run` new YouTube videos per run, ingest `@thealphaschool` / UU dumps / Shorts-tab dumps, wipe Neo4j, or touch the MCP service. Graph/Neo4j is skipped in the job (no Docker/Aura on Cloud Run).
 
 Project is LearningFocus (`gen-lang-client-0304733057`, the scripts' default; `GCP_BACKUP_PROJECT` overrides it, see `scripts/_gcp_env.sh`) / `us-west1`. Do not deploy to `inferpoker`; that project belongs to InferPoker.
 
@@ -14,17 +14,16 @@ uv run python -m src.pipeline.daily_ingest
 
 | Flag | Role |
 | --- | --- |
-| `--dry-run` | Walk the orchestrator; do not call pipelines, GCS, or MCP roll |
-| `--skip-hydrate` | Do not pull chroma/artifacts from GCS (laptop with a local corpus) |
-| `--skip-sync` | Do not upload artifacts/chroma |
-| `--skip-roll` | Do not roll `learningfocused-mcp` |
+| `--dry-run` | Walk the orchestrator; do not call pipelines or GCS |
+| `--skip-hydrate` | Do not pull artifacts from GCS (laptop with a local corpus) |
+| `--skip-sync` | Do not upload artifacts |
 | `--source KEY` | Run only this registry key, due or not (repeatable) |
 | `--skip KEY` | Skip a registry key (repeatable) |
 | `--skip-art19` / `--skip-substack` / `--skip-youtube` | Shorthands for `--skip` |
 
-Isolation: each source is wrapped in `try/except`. Art19 raising does not skip Substack or YouTube. The process still writes the ledger and attempts GCS sync + MCP roll.
+Isolation: each source is wrapped in `try/except`. Art19 raising does not skip Substack or YouTube. The process still writes the ledger and attempts the GCS sync.
 
-Wrapped runners (Neo4j always skipped; `--force` off; `--reset-chroma` off). Limits come from each source's `config` in `sources.json`; a bad value fails only that source.
+Wrapped runners (Neo4j always skipped; `--force` off). Limits come from each source's `config` in `sources.json`; a bad value fails only that source.
 
 - `podcast_rss` (Art19): `python -m src.pipeline.audio.run --skip-neo4j -- --mode daily --download-limit <download_limit>` (`DAILY_ART19_DOWNLOAD_LIMIT` env overrides)
 - `substack`: `python -m src.pipeline.substack.run --skip-neo4j -- --mode daily --ingest-limit <ingest_limit>`
@@ -43,9 +42,9 @@ Every run writes:
 - `gs://learningfocused-corpus/ingest_ledger/<run_id>.json`
 - `gs://learningfocused-corpus/ingest_ledger/latest.json`
 
-Fields: `started_at` / `finished_at`, per-source `ok` / `error`, hydrate counts, GCS upload stats, MCP revision after roll, `pg_state`.
+Fields: `started_at` / `finished_at`, per-source `ok` / `error`, hydrate counts, GCS upload stats, `pg_state`.
 
-With `PG_DSN` set, the run also mirrors `sources.json` into the `sources` table, reads each source's last check (for weekly cadence), and writes `ingest_runs` + `source_checks`. After the sources run it also copies new and changed Chroma chunks into Postgres and removes the ones Chroma no longer has (`pg_state.chroma_to_pg`, see [postgres.md](postgres.md)). Any Postgres error is recorded under `pg_state` and never fails the run. Until the job is given `PG_DSN` (with the MCP Postgres switch), weekly sources run on Mondays.
+The run also mirrors `sources.json` into the `sources` table, reads each source's last check (for weekly cadence), and writes `ingest_runs` + `source_checks`. A bookkeeping error is recorded under `pg_state` and never fails the run. Indexing is part of each source: if Postgres is unreachable, that source fails, and the next run catches up (every run compares the whole on-disk corpus with Postgres; unchanged chunks are not re-embedded).
 
 ## Cloud Run Job
 
@@ -88,34 +87,26 @@ Then pipelines run with skip-existing. Then checksum upload of those prefixes. T
 
 The scheduler only *starts* the job (deadline 180s). The job itself may run for hours.
 
-## MCP roll
+## MCP service
 
-After a successful GCS sync the job PATCHes `learningfocused-mcp` with `CHROMA_SNAPSHOT_AT=<run_id>`. That creates a **new revision** of the existing image (no image rebuild, no `--min-instances=0`). New instances hydrate `gs://…/chroma_db/` onto `/data/chroma_db`. Old warm instances drain. Public `/mcp` stays unauthenticated.
-
-The ingest SA also needs `roles/artifactregistry.reader` on `cloud-run-source-deploy` so Cloud Run can pull the current MCP image when minting that revision. The repo IAM was empty until that binding was applied live; `./scripts/deploy_ingest_job.sh` grants it and fails if the member is missing.
-
-Confirm:
-
-```bash
-gcloud artifacts repositories get-iam-policy cloud-run-source-deploy --location=us-west1 --project=gen-lang-client-0304733057
-```
+The job no longer rolls `learningfocused-mcp`: the service reads Postgres live, so new chunks are searchable as soon as a source commits them. `./scripts/deploy_ingest_job.sh` no longer grants the ingest SA `roles/run.developer`, Artifact Registry reader or actAs on the MCP SA, which only the roll needed; bindings granted by earlier deploys stay until removed by hand.
 
 ## “New RSS episode without a laptop”
 
 The job cannot wait for S E357. Structural proof:
 
 1. Art19 `download.py` skips existing transcripts and only downloads titles that are not already transcribed.
-2. Cloud Run Job executions walk all three sources with skip-existing (no `--force`, no `--reset-chroma`, no 6 GiB audio pull). Scheduler run `learningfocused-ingest-75gz8` was created at 08:00 America/Los_Angeles by `learningfocused-ingest@` (not a laptop `gcloud`).
+2. Cloud Run Job executions walk all three sources with skip-existing (no `--force`, no 6 GiB audio pull). Scheduler run `learningfocused-ingest-75gz8` was created at 08:00 America/Los_Angeles by `learningfocused-ingest@` (not a laptop `gcloud`).
 3. Scheduler `learningfocused-ingest-daily` is ENABLED, `0 8 * * *` America/Los_Angeles, targeting the job `:run` API.
 4. (Proof from the original `inferpoker` deployment, before the move to LearningFocus.) After Artifact Registry reader was applied on `cloud-run-source-deploy`, job execution `learningfocused-ingest-ctwxh` (runtime SA `learningfocused-ingest@`) wrote `mcp_roll.ok: true` and minted revision `learningfocused-mcp-00004-lhp` with `serving.knative.dev/creator: learningfocused-ingest@inferpoker.iam.gserviceaccount.com` and `minScale=1`. Public `/health` 200 and unauthenticated `/mcp` still work.
 
-When E357 (or any new Art19 item) appears in the RSS feed, the next 08:00 Pacific run downloads that one MP3, transcribes it, upserts Chroma, uploads the snapshot, and rolls MCP — no laptop session required.
+When E357 (or any new Art19 item) appears in the RSS feed, the next 08:00 Pacific run downloads that one MP3, transcribes it, and embeds its chunks into Postgres, where MCP can search them — no laptop session required.
 
 ## Local
 
 Keep the Mac awake if you hydrate/ingest locally (`caffeinate`). Prefer the Cloud Run Job for the daily path.
 
 ```bash
-uv run python -m src.pipeline.daily_ingest --dry-run --skip-hydrate --skip-sync --skip-roll
+uv run python -m src.pipeline.daily_ingest --dry-run --skip-hydrate --skip-sync
 uv run python -m src.tests.test_daily_ingest
 ```
