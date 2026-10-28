@@ -69,7 +69,13 @@ It is idempotent: each page of Chroma rows is compared with Postgres first (text
 
 `--prune` deletes chunks that are no longer in Chroma (Chroma's `--prune-stale-chroma` runs remove rows after re-segmenting or id changes) and documents left with no chunks. It is skipped, and the command exits 1, when Chroma is empty or the prune would delete more than 10% of chunks (`--max-prune-fraction`), since that points to an incomplete Chroma copy rather than retired content.
 
-**Daily dual-write.** Once the daily job has `PG_DSN`, it runs the same sync with prune right after the sources (ledger: `pg_state.chroma_to_pg`, whose stats include `prune_skipped` when the 10% guard held a prune back). A Postgres failure is recorded and never fails ingest. Postgres then follows Chroma, deletes included, until the MCP server reads Postgres directly.
+**Daily writes go straight to Postgres.** The source pipelines no longer write Chroma: `src/pipeline/index_pg.py` collects the same Documents and ids, compares them with `chunks` (text, metadata, document), embeds only new or changed rows with `text-embedding-3-small`, and upserts them, committing per batch. A local dry-run against a scratch Postgres backfill found 5,403 unique collected rows: 5,219 unchanged and 184 that would be embedded (182 with changed series-summary text and two with float-rounding differences in `start_time`). These are rows, not API calls: embedding requests are batched. Run the dry-run against the intended corpus before estimating first-run work. Pruning is opt-in (`--prune-stale`, also accepted as `--prune-stale-chroma`), only for segment types, refused when any artifact failed to parse, and held back above 10% of a type's rows:
+
+```bash
+PG_DSN=... uv run python -m src.pipeline.index_pg --dry-run --include-youtube   # count what would be embedded
+```
+
+`pg_sync` above is now only the one-time backfill from an existing `chroma_db/`.
 
 **Graph (from the local Neo4j, any size).** Run on the Mac that has Neo4j, with the tunnel open:
 
@@ -85,7 +91,7 @@ Neither tool deletes anything in Chroma or Neo4j.
 
 ## Serving it
 
-`src/database/pg_search.py` holds the read-only retrieval (keyword, vector, hybrid, graph templates). The MCP server uses it when deployed with `KB_BACKEND=postgres`; the tools, the eval comparison and the switch are in [mcp_server.md](mcp_server.md). Once `deploy_postgres_vm.sh` has created the DSN secret, `./scripts/deploy_ingest_job.sh` also gives the daily job `PG_DSN` and VPC egress (`INGEST_PG=0` opts out).
+`src/database/pg_search.py` holds the read-only retrieval (keyword, vector, hybrid, graph templates). The MCP server uses it when deployed with `KB_BACKEND=postgres`; the tools, the eval comparison and the switch are in [mcp_server.md](mcp_server.md). Once `deploy_postgres_vm.sh` has created the DSN secret, `./scripts/deploy_ingest_job.sh` gives the daily job `PG_DSN` and VPC egress; the job requires them, since it writes chunks straight into Postgres.
 
 ## Local development
 

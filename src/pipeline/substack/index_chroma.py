@@ -121,7 +121,7 @@ def collect_substack_documents() -> List[Document]:
 
     # Article summaries
     if ARTICLE_SUMMARIES_DIR.exists():
-        for filename in os.listdir(ARTICLE_SUMMARIES_DIR):
+        for filename in sorted(os.listdir(ARTICLE_SUMMARIES_DIR)):
             if filename.endswith("_summary.json"):
                 path = os.path.join(ARTICLE_SUMMARIES_DIR, filename)
                 try:
@@ -132,7 +132,7 @@ def collect_substack_documents() -> List[Document]:
 
     # Article text
     if SUBSTACK_TEXT_DIR.exists() and SUBSTACK_METADATA_DIR.exists():
-        for text_path in SUBSTACK_TEXT_DIR.glob("*.md"):
+        for text_path in sorted(SUBSTACK_TEXT_DIR.glob("*.md")):
             meta_path = SUBSTACK_METADATA_DIR / f"{text_path.stem}.json"
             if not meta_path.exists():
                 continue

@@ -52,12 +52,11 @@ class TestYoutubeRunRefuses(unittest.TestCase):
             code = main(["--dry-run"])
         self.assertEqual(code, 2)
 
-    def test_prune_stale_chroma_flag_exists_and_defaults_off(self) -> None:
+    def test_prune_stale_flag_exists_and_defaults_off(self) -> None:
         parser = build_parser()
-        args = parser.parse_args([])
-        self.assertFalse(args.prune_stale_chroma)
-        args = parser.parse_args(["--prune-stale-chroma"])
-        self.assertTrue(args.prune_stale_chroma)
+        self.assertFalse(parser.parse_args([]).prune_stale)
+        self.assertTrue(parser.parse_args(["--prune-stale"]).prune_stale)
+        self.assertTrue(parser.parse_args(["--prune-stale-chroma"]).prune_stale)  # old name still works
 
     def test_ingest_one_skips_complete_artifacts_without_ytdlp(self) -> None:
         from src.pipeline.youtube.run import Candidate, ingest_one

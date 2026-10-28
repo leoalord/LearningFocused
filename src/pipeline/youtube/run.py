@@ -1,7 +1,7 @@
 """YouTube unique-ingest runner (TASK-5).
 
 Ingests a documented V1 cap of unique videos (not RSS twins), writes artifacts,
-and upserts `youtube_*` Chroma types. Refuses --channel, --reset-chroma, UU dumps,
+and upserts `youtube_*` chunk types into Postgres. Refuses --channel, --reset-chroma, UU dumps,
 @thealphaschool, and the 188 Shorts tab.
 
 Default model for summarize/segment: gemini-flash-latest.
@@ -70,7 +70,7 @@ YouTube pipeline (TASK-5 unique ingest)
 Channel in scope: @future_of_education (UCKHZkY1J1NyKypLn80Pj19A)
 Out of scope: @thealphaschool, full UU-playlist / full-channel ingest, 188 Shorts tab
 
-Chroma type (retrieval role):
+Chunk type (retrieval role):
   youtube_transcript_segment   -> query_segments
   youtube_summary_overview     -> query_summaries
 
@@ -502,16 +502,9 @@ def write_skip_log(skipped: list[SkipDecision], extra: dict[str, Any] | None = N
 
 
 def index_youtube_only(*, prune_stale: bool = False) -> None:
-    from src.pipeline.index_chroma import update_chroma_db
+    from src.pipeline.index_pg import update_pg_index
 
-    update_chroma_db(
-        reset=False,
-        include_audio=False,
-        include_articles=False,
-        include_youtube=True,
-        confirm_reset=None,
-        prune_stale=prune_stale,
-    )
+    update_pg_index(include_audio=False, include_articles=False, include_youtube=True, prune_stale=prune_stale)
 
 
 V1_TOTAL_CAP = V1_UNIQUE_LONGFORM + V1_APPEARANCES + V1_BRANDING + V1_SHORTS
@@ -571,9 +564,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--print-plan", action="store_true", help="Print the ingest contract and exit.")
     p.add_argument("--dry-run", action="store_true", help="Resolve V1 candidates + skip proof; do not download.")
-    p.add_argument("--skip-chroma", action="store_true", help="Skip Chroma upsert.")
+    p.add_argument("--skip-index", "--skip-chroma", dest="skip_index", action="store_true",
+                   help="Skip the Postgres upsert.")
     p.add_argument(
+        "--prune-stale",
         "--prune-stale-chroma",
+        dest="prune_stale",
         action="store_true",
         help=(
             "After upsert, delete youtube_transcript_segment rows the on-disk artifacts "
@@ -751,8 +747,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
     if args.dry_run:
-        print("Dry run: no downloads / no Chroma writes.")
+        print("Dry run: no downloads / no Postgres writes.")
         return 0
+
+    if not args.skip_index:
+        from src.pipeline.index_pg import require_postgres
+
+        require_postgres()
 
     result = IngestResult(skipped=[asdict(s) for s in skipped], v1_cap=v1_cap)
     for cand in candidates:
@@ -768,11 +769,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"\nIngested {len(result.ingested)} / {len(candidates)} (failed {len(result.failed)})")
     if args.feed:
         update_feed_failures(ingested=result.ingested, failed=result.failed)
-    if not args.skip_chroma:
-        print("\n=== CHROMA UPSERT (youtube_* only; no reset, no audio/Substack) ===")
-        index_youtube_only(prune_stale=args.prune_stale_chroma)
+    if not args.skip_index:
+        print("\n=== POSTGRES UPSERT (youtube_* only; no audio/Substack) ===")
+        index_youtube_only(prune_stale=args.prune_stale)
     else:
-        print("Skipping Chroma upsert (--skip-chroma).")
+        print("Skipping Postgres upsert (--skip-index).")
 
     print(json.dumps({"ingested": result.ingested, "failed": result.failed, "v1_cap": v1_cap["counts"]}, indent=2))
     return 0 if not result.failed else 1

@@ -252,36 +252,6 @@ class TestBackendSwitch(unittest.TestCase):
         self.assertLessEqual(retrieve.call_args.kwargs["max_segments"], 8)
         self.assertEqual(fetch.call_args.args[0], "S2 E7")
 
-    def test_daily_job_does_not_roll_a_postgres_mcp(self) -> None:
-        from unittest.mock import MagicMock
-
-        from src.pipeline import daily_ingest
-
-        self.assertEqual(daily_ingest.mcp_backend({"env": []}), "chroma")
-        service = {"template": {"containers": [{"env": [{"name": "KB_BACKEND", "value": "postgres"}]}],
-                                "scaling": {"minInstanceCount": 0}}}
-        session = MagicMock()
-        session.get.return_value = MagicMock(ok=True, json=lambda: service)
-        with patch("google.auth.default", return_value=(MagicMock(spec=[]), "p")), \
-                patch("google.auth.transport.requests.AuthorizedSession", return_value=session):
-            result = daily_ingest.roll_mcp_service(project="p", region="r", service="s", snapshot_at="t")
-        self.assertTrue(result["skipped"])  # min instances 0 is fine: nothing to roll
-        session.patch.assert_not_called()
-
-    def test_postgres_mcp_without_a_fresh_copy_fails_the_run(self) -> None:
-        from src.feeds.registry import SourceConfig
-        from src.pipeline import daily_ingest
-
-        skipped = {"service": "s", "skipped": True, "reason": "KB_BACKEND=postgres reads live data"}
-        registry = [SourceConfig(key="art19", kind="podcast_rss", name="a")]
-        with patch.object(daily_ingest, "roll_mcp_service", return_value=skipped), \
-                patch("src.feeds.state.is_enabled", return_value=False):
-            ledger = daily_ingest.run(hydrate=False, sync=False, roll=True, registry=registry,
-                                      source_runners={"art19": lambda: {}})
-        self.assertFalse(ledger["mcp_roll"]["ok"])
-        self.assertIn("no PG_DSN", ledger["mcp_roll"]["reason"])
-        self.assertFalse(ledger["ok"])
-
 
 if __name__ == "__main__":
     unittest.main()

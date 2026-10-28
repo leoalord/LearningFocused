@@ -1,7 +1,7 @@
 """GCS corpus snapshot helpers (hydrate + checksum upload).
 
 Used by the public MCP hydrate path and the daily ingest job. Does not
---reset-chroma, touch Neo4j, or upload .env / pem / SA JSON.
+touch Neo4j or upload .env / pem / SA JSON.
 """
 
 from __future__ import annotations
@@ -13,9 +13,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-# Derived artifacts + chroma snapshot. Never the 6GB podcast_downloads dump.
+# Derived text artifacts the daily job reads and writes. Never the 6GB podcast_downloads
+# dump. The old chroma_db/ snapshot stays in the bucket but is no longer synced: chunks
+# and embeddings live in Postgres.
 ARTIFACT_PREFIXES = (
-    "chroma_db",
     "transcripts",
     "segmented_transcripts",
     "combined_summaries",
@@ -116,21 +117,20 @@ def download_prefix(
 
 
 def hydrate_artifacts(*, bucket: str | None = None, project: str | None = None) -> dict[str, int]:
-    """Pull chroma + derived text artifacts. Does not pull podcast_downloads."""
+    """Pull the derived text artifacts. Does not pull podcast_downloads.
+
+    `transcripts/` must not come back empty: the audio pipeline skips episodes it has a
+    transcript for, so an empty hydrate would re-download and re-transcribe the feed.
+    """
     counts: dict[str, int] = {}
     for prefix in ARTIFACT_PREFIXES:
-        require = prefix == "chroma_db"
         counts[prefix] = download_prefix(
             bucket=bucket,
             prefix=prefix,
             dest=local_dir_for_prefix(prefix),
             project=project,
-            require_files=require,
+            require_files=prefix == "transcripts",
         )
-    chroma = local_dir_for_prefix("chroma_db") / "chroma.sqlite3"
-    if not chroma.is_file():
-        raise FileNotFoundError(f"Hydrate finished but {chroma} is missing")
-    print(f"Chroma snapshot ready at {chroma} ({chroma.stat().st_size} bytes)")
     return counts
 
 

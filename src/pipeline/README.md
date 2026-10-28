@@ -35,10 +35,10 @@ uv run python -m src.pipeline.youtube.run --dry-run
 uv run python -m src.pipeline.youtube.run
 ```
 
-- **Daily ingest** (Art19 + Substack + unique YouTube, isolated failures, ledger, GCS, MCP roll):
+- **Daily ingest** (Art19 + Substack + unique YouTube, isolated failures, ledger, GCS sync, Postgres index):
 
 ```bash
-uv run python -m src.pipeline.daily_ingest --dry-run --skip-hydrate --skip-sync --skip-roll
+uv run python -m src.pipeline.daily_ingest --dry-run --skip-hydrate --skip-sync
 ./scripts/deploy_ingest_job.sh
 ```
 

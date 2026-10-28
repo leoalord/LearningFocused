@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
 # Deploy the daily ingest Cloud Run Job + Cloud Scheduler (LearningFocus gen-lang-client-0304733057 / us-west1).
 # Separate from the public MCP service. Deploys to the LearningFocus project (same as .env GCP_PROJECT_ID).
-# Does not --reset-chroma, re-transcribe, wipe Neo4j, or scale MCP to zero.
+# Does not re-transcribe or wipe Neo4j, and does not touch the MCP service.
 #
-# Postgres: once deploy_postgres_vm.sh has created the learningfocused-pg-dsn secret, the
-# job gets PG_DSN and Direct VPC egress, so it records feed state and copies Chroma into
-# Postgres each day. INGEST_PG=0 leaves Postgres out; INGEST_PG=1 requires it.
-# When the MCP service runs with KB_BACKEND=postgres the job doesn't roll it.
+# Postgres is required: the job writes chunks and embeddings straight into it, so it needs
+# the learningfocused-pg-dsn secret (created by deploy_postgres_vm.sh) and Direct VPC egress.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -19,8 +17,6 @@ SCHEDULER_SCHEDULE="${CLOUD_SCHEDULER_SCHEDULE:-0 8 * * *}"
 SCHEDULER_TZ="${CLOUD_SCHEDULER_TZ:-America/Los_Angeles}"
 SA_NAME="${INGEST_SA:-learningfocused-ingest}"
 SA_EMAIL="${SA_NAME}@${PROJECT}.iam.gserviceaccount.com"
-MCP_SA="${CLOUD_RUN_SA:-learningfocused-mcp}@${PROJECT}.iam.gserviceaccount.com"
-MCP_SERVICE="${MCP_SERVICE:-learningfocused-mcp}"
 SECRET_OPENAI="${SECRET_OPENAI:-learningfocused-openai-api-key}"
 SECRET_GOOGLE="${SECRET_GOOGLE:-learningfocused-google-api-key}"
 SECRET_ASSEMBLYAI="${SECRET_ASSEMBLYAI:-learningfocused-assemblyai-api-key}"
@@ -29,7 +25,6 @@ SECRET_ASSEMBLYAI="${SECRET_ASSEMBLYAI:-learningfocused-assemblyai-api-key}"
 SECRET_ANTHROPIC="${SECRET_ANTHROPIC:-learningfocused-anthropic-api-key}"
 SECRET_FIREWORKS="${SECRET_FIREWORKS:-learningfocused-fireworks-api-key}"
 EXECUTE_NOW="${EXECUTE_NOW:-0}"
-INGEST_PG="${INGEST_PG:-auto}"
 SECRET_DSN="${SECRET_PG_DSN:-learningfocused-pg-dsn}"
 NETWORK="${PG_NETWORK:-default}"
 SUBNET="${PG_SUBNET:-default}"
@@ -62,32 +57,19 @@ if ! gcloud iam service-accounts describe "${SA_EMAIL}" --project="${PROJECT}" >
   sleep 8
 fi
 
-echo ">> Granting ${SA_EMAIL} objectAdmin on gs://${BUCKET} (job writes artifacts/chroma/ledger)"
+echo ">> Granting ${SA_EMAIL} objectAdmin on gs://${BUCKET} (job writes artifacts and the ledger)"
 gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" \
   --member="serviceAccount:${SA_EMAIL}" \
   --role="roles/storage.objectAdmin" \
   --condition=None \
   --project="${PROJECT}" >/dev/null
 
-case "${INGEST_PG}" in
-  0) USE_PG=0 ;;
-  1|auto)
-    if gcloud secrets describe "${SECRET_DSN}" --project="${PROJECT}" >/dev/null 2>&1; then
-      USE_PG=1
-    elif [[ "${INGEST_PG}" == "1" ]]; then
-      echo "INGEST_PG=1 but secret ${SECRET_DSN} does not exist. Run ./scripts/deploy_postgres_vm.sh first." >&2
-      exit 1
-    else
-      USE_PG=0
-    fi
-    ;;
-  *) echo "INGEST_PG must be auto, 0 or 1 (got ${INGEST_PG})" >&2; exit 2 ;;
-esac
-
-JOB_SECRETS=("${SECRET_OPENAI}" "${SECRET_GOOGLE}" "${SECRET_ASSEMBLYAI}" "${SECRET_ANTHROPIC}" "${SECRET_FIREWORKS}")
-if [[ "${USE_PG}" == "1" ]]; then
-  JOB_SECRETS+=("${SECRET_DSN}")
+if ! gcloud secrets describe "${SECRET_DSN}" --project="${PROJECT}" >/dev/null 2>&1; then
+  echo "Secret ${SECRET_DSN} does not exist. Run ./scripts/deploy_postgres_vm.sh first." >&2
+  exit 1
 fi
+
+JOB_SECRETS=("${SECRET_OPENAI}" "${SECRET_GOOGLE}" "${SECRET_ASSEMBLYAI}" "${SECRET_ANTHROPIC}" "${SECRET_FIREWORKS}" "${SECRET_DSN}")
 
 for secret in "${JOB_SECRETS[@]}"; do
   echo ">> Granting secretAccessor on ${secret}"
@@ -109,51 +91,11 @@ for secret in "${JOB_SECRETS[@]}"; do
   fi
 done
 
-echo ">> Granting ${SA_EMAIL} run.developer (roll ${MCP_SERVICE}, do not scale to zero)"
-gcloud projects add-iam-policy-binding "${PROJECT}" \
-  --member="serviceAccount:${SA_EMAIL}" \
-  --role="roles/run.developer" \
-  --condition=None \
-  >/dev/null
-
-AR_REPO_SOURCE="${AR_REPO_SOURCE:-cloud-run-source-deploy}"
-echo ">> Granting ${SA_EMAIL} artifactregistry.reader on ${AR_REPO_SOURCE} (needed to mint a new MCP revision)"
-gcloud artifacts repositories add-iam-policy-binding "${AR_REPO_SOURCE}" \
-  --location="${REGION}" \
-  --member="serviceAccount:${SA_EMAIL}" \
-  --role="roles/artifactregistry.reader" \
-  --project="${PROJECT}"
-
-echo ">> Verifying Artifact Registry IAM on ${AR_REPO_SOURCE} (must include ingest SA reader)"
-gcloud artifacts repositories get-iam-policy "${AR_REPO_SOURCE}" \
-  --location="${REGION}" \
-  --project="${PROJECT}"
-if ! gcloud artifacts repositories get-iam-policy "${AR_REPO_SOURCE}" \
-  --location="${REGION}" \
-  --project="${PROJECT}" \
-  --flatten='bindings[].members' \
-  --filter="bindings.role=roles/artifactregistry.reader AND bindings.members:serviceAccount:${SA_EMAIL}" \
-  --format='value(bindings.members)' | grep -q "serviceAccount:${SA_EMAIL}"; then
-  echo "Failed: ${SA_EMAIL} is not artifactregistry.reader on ${AR_REPO_SOURCE}" >&2
-  exit 1
-fi
-
-echo ">> Granting ${SA_EMAIL} actAs on MCP runtime SA ${MCP_SA}"
-gcloud iam service-accounts add-iam-policy-binding "${MCP_SA}" \
-  --member="serviceAccount:${SA_EMAIL}" \
-  --role="roles/iam.serviceAccountUser" \
-  --project="${PROJECT}" >/dev/null
-
 SECRETS="OPENAI_API_KEY=${SECRET_OPENAI}:latest,GOOGLE_API_KEY=${SECRET_GOOGLE}:latest,ASSEMBLYAI_API_KEY=${SECRET_ASSEMBLYAI}:latest"
 SECRETS+=",ANTHROPIC_API_KEY=${SECRET_ANTHROPIC}:latest,FIREWORKS_API_KEY=${SECRET_FIREWORKS}:latest"
-if [[ "${USE_PG}" == "1" ]]; then
-  SECRETS+=",PG_DSN=${SECRET_DSN}:latest"
-  NETWORK_FLAGS=(--network="${NETWORK}" --subnet="${SUBNET}" --vpc-egress=private-ranges-only)
-else
-  NETWORK_FLAGS=(--clear-network)
-fi
+SECRETS+=",PG_DSN=${SECRET_DSN}:latest"
 
-echo ">> Deploying Cloud Run Job ${JOB} (${REGION}, Postgres: $([[ "${USE_PG}" == "1" ]] && echo on || echo off))"
+echo ">> Deploying Cloud Run Job ${JOB} (${REGION})"
 gcloud run jobs deploy "${JOB}" \
   --quiet \
   --source "${ROOT}" \
@@ -167,8 +109,8 @@ gcloud run jobs deploy "${JOB}" \
   --max-retries=1 \
   --parallelism=1 \
   --tasks=1 \
-  "${NETWORK_FLAGS[@]}" \
-  --set-env-vars="GCP_BACKUP_PROJECT=${PROJECT},GCS_CORPUS_BUCKET=${BUCKET},GCS_CHROMA_BUCKET=${BUCKET},MCP_SERVICE=${MCP_SERVICE},MCP_REGION=${REGION},HYDRATE_CHROMA=0,CHROMA_DIR=/app/chroma_db,DAILY_ART19_DOWNLOAD_LIMIT=5" \
+  --network="${NETWORK}" --subnet="${SUBNET}" --vpc-egress=private-ranges-only \
+  --set-env-vars="GCP_BACKUP_PROJECT=${PROJECT},GCS_CORPUS_BUCKET=${BUCKET},DAILY_ART19_DOWNLOAD_LIMIT=5" \
   --set-secrets="${SECRETS}"
 
 echo ">> Job is not public (no allUsers). Granting scheduler invoker on the job."
@@ -218,15 +160,14 @@ echo "SA:        ${SA_EMAIL}"
 echo "Scheduler: ${SCHEDULER_JOB}"
 echo "Schedule:  ${SCHEDULER_SCHEDULE} (${SCHEDULER_TZ})"
 echo "Target:    ${URI}"
-echo "MCP roll:  ${MCP_SERVICE} (chroma backend only; min instances stay >= 1)"
-echo "Postgres:  $([[ "${USE_PG}" == "1" ]] && echo "PG_DSN from ${SECRET_DSN}, VPC egress ${NETWORK}/${SUBNET}" || echo "not wired (no ${SECRET_DSN} secret or INGEST_PG=0)")"
+echo "Postgres:  PG_DSN from ${SECRET_DSN}, VPC egress ${NETWORK}/${SUBNET}"
 echo
 echo "Does not pull gs://${BUCKET}/podcast_downloads (6GB). Skip-existing uses hydrated transcripts."
 echo "A new RSS episode is downloaded + transcribed; existing files are not re-transcribed."
 echo
 
 if [[ "${EXECUTE_NOW}" == "1" ]]; then
-  echo ">> Executing ${JOB} once (skip-existing; no --reset-chroma)"
+  echo ">> Executing ${JOB} once (skip-existing)"
   gcloud run jobs execute "${JOB}" --region="${REGION}" --project="${PROJECT}" --wait
 fi
 

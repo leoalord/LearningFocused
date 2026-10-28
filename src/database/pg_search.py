@@ -41,7 +41,7 @@ MAX_GRAPH_HOPS = 3
 _PASSAGE_RELATIONSHIPS = ("MENTIONS",)
 SCHEMA_CACHE_SECONDS = 300
 NAME_KEY = "name_lc"  # lower-cased entity name written by neo4j_to_age
-EMBEDDING_MODEL = "text-embedding-3-small"
+EMBEDDING_MODEL = pg_store.EMBEDDING_MODEL
 _AGTYPE_SUFFIX = re.compile(r"(?<=[}\]])::(?:vertex|edge|path)")
 _LABEL_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 
