@@ -70,6 +70,7 @@ class TestPipelinesIndexPostgres(unittest.TestCase):
 
         quiet_day = SimpleNamespace(mode="daily", new_transcripts_created=0, transcribe_failed=0)
         with patch("src.pipeline.audio.process_all.main", return_value=quiet_day), \
+                patch("src.pipeline.index_pg.require_postgres"), \
                 patch("src.pipeline.index_pg.update_pg_index") as index:
             audio_run.main(["--skip-summaries", "--skip-neo4j", "--", "--mode", "daily"])
         index.assert_called_once_with(include_audio=True, include_articles=False, include_youtube=False,
@@ -93,11 +94,28 @@ class TestPipelinesIndexPostgres(unittest.TestCase):
                 substack_run.main(["--skip-processing", "--skip-neo4j", "--skip-index"])  # opting out still works
             index.assert_not_called()
 
+    def test_pipelines_refuse_to_start_when_postgres_is_unreachable(self) -> None:
+        from src.pipeline.audio import run as audio_run
+        from src.pipeline.substack import run as substack_run
+
+        # Nothing listens on port 1: PG_DSN is set, but the server never answers.
+        with patch.dict(os.environ, {"PG_DSN": "postgresql://nobody@127.0.0.1:1/none"}), \
+                patch("src.pipeline.audio.process_all.main", side_effect=AssertionError("paid work ran")), \
+                patch("src.pipeline.substack.process_all.main", side_effect=AssertionError("paid work ran")):
+            with self.assertRaisesRegex(RuntimeError, "Postgres is unreachable"):
+                audio_run.main(["--skip-neo4j", "--", "--mode", "daily"])
+            with self.assertRaisesRegex(RuntimeError, "Postgres is unreachable"):
+                substack_run.main(["--skip-neo4j", "--", "--mode", "daily"])
+            with patch("src.pipeline.index_pg.update_pg_index") as index:
+                substack_run.main(["--skip-processing", "--skip-neo4j", "--skip-index"])  # opting out still works
+            index.assert_not_called()
+
     def test_substack_and_youtube_index_their_own_types(self) -> None:
         from src.pipeline.substack import run as substack_run
         from src.pipeline.youtube.run import index_youtube_only
 
-        with patch("src.pipeline.index_pg.update_pg_index") as index:
+        with patch("src.pipeline.index_pg.require_postgres"), \
+                patch("src.pipeline.index_pg.update_pg_index") as index:
             substack_run.main(["--skip-processing", "--skip-neo4j"])
             index_youtube_only(prune_stale=True)
         self.assertEqual(index.call_args_list[0].kwargs,
@@ -105,6 +123,23 @@ class TestPipelinesIndexPostgres(unittest.TestCase):
         self.assertEqual(index.call_args_list[1].kwargs,
                          {"include_audio": False, "include_articles": False, "include_youtube": True,
                           "prune_stale": True})
+
+
+@unittest.skipUnless(PG_TEST_DSN, SKIP_REASON)
+class TestRequirePostgres(unittest.TestCase):
+    def test_needs_migrated_schema_and_a_login_that_can_write(self) -> None:
+        from src.database import pg_store
+        from src.pipeline.index_pg import require_postgres
+        from src.tests.pg_testutil import with_credentials
+
+        with TempDatabase() as db:
+            with self.assertRaisesRegex(RuntimeError, "no chunks/documents tables"):
+                require_postgres(db.dsn)
+            pg_store.migrate(db.dsn, reader_role="lf_reader_preflight_t", reader_password="reader-pw")
+            require_postgres(db.dsn)
+            reader = with_credentials(db.dsn, "lf_reader_preflight_t", "reader-pw")
+            with self.assertRaisesRegex(RuntimeError, "cannot write chunks/documents"):
+                require_postgres(reader)
 
 
 @unittest.skipUnless(PG_TEST_DSN, SKIP_REASON)
@@ -159,12 +194,17 @@ class TestUpdatePgIndex(unittest.TestCase):
             pg_store.migrate(db.dsn)
             docs = [_doc(f"s{i}", f"segment {i}", type="transcript_segment", episode_id="E1", title="Ep")
                     for i in range(150)]
+            stale = _doc("gone", "a segment the artifacts no longer produce", type="transcript_segment",
+                         episode_id="E1", title="Ep")
+            update_pg_index(dsn=db.dsn, embed=FakeEmbedder(), documents=[stale])
+            # 1 stale of 101 segments is under the 10% limit, so only the failure stops the prune.
             with self.assertRaisesRegex(RuntimeError, "embedding API down"):
                 update_pg_index(dsn=db.dsn, embed=FailsSecondBatch(), documents=docs, prune_stale=True)
             with pg_store.session(db.dsn) as conn:
-                row = conn.execute("SELECT count(*) FROM chunks").fetchone()
+                row = conn.execute("SELECT count(*) FILTER (WHERE id <> 'gone'), "
+                                   "count(*) FILTER (WHERE id = 'gone') FROM chunks").fetchone()
             assert row is not None
-            self.assertEqual(row[0], 100)  # the first batch of 100 stayed committed
+            self.assertEqual(tuple(row), (100, 1))  # the first batch of 100 stayed committed; nothing pruned
 
             resumed = update_pg_index(dsn=db.dsn, embed=FakeEmbedder(), documents=docs)
             self.assertEqual((resumed.unchanged, resumed.embedded), (100, 50))
@@ -176,6 +216,8 @@ class TestUpdatePgIndex(unittest.TestCase):
             pg_store.migrate(db.dsn)
             embed = FakeEmbedder()
             update_pg_index(dsn=db.dsn, embed=embed, documents=_corpus())
+            with pg_store.session(db.dsn) as conn:  # e.g. a Substack post with no chunks yet
+                conn.execute("INSERT INTO documents (doc_id, source_type) VALUES ('post-empty', 'substack')")
             without_s2 = [d for d in _corpus() if d.metadata["_chroma_id"] != "s2"]
 
             kept = update_pg_index(dsn=db.dsn, embed=embed, documents=without_s2)
@@ -197,6 +239,18 @@ class TestUpdatePgIndex(unittest.TestCase):
             with pg_store.session(db.dsn) as conn:
                 ids = sorted(r[0] for r in conn.execute("SELECT id FROM chunks").fetchall())
             self.assertEqual(ids, ["a1", "o1", "s1"])  # only the stale segment went
+            self.assertEqual(pruned.documents_pruned, 0)  # its episode still has s1
+
+            only_s1_ep2 = [d for d in without_s2 if d.metadata["_chroma_id"] != "s1"] + [
+                _doc("s9", "next episode", type="transcript_segment", episode_id="S2E002", title="Ep 2")
+            ]
+            emptied = update_pg_index(dsn=db.dsn, embed=embed, documents=only_s1_ep2, prune_stale=True,
+                                      max_prune_fraction=0.5, include_articles=False)
+            self.assertEqual((emptied.chunks_pruned, emptied.documents_pruned), (1, 1))
+            with pg_store.session(db.dsn) as conn:
+                doc_ids = {r[0] for r in conn.execute("SELECT doc_id FROM documents").fetchall()}
+            self.assertNotIn(f"podcast:{episode_key('S2E001', 'Ep 1')}", doc_ids)  # emptied by the prune
+            self.assertIn("post-empty", doc_ids)  # not this prune's to delete
 
 
 if __name__ == "__main__":

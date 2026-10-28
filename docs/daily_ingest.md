@@ -65,14 +65,13 @@ The public MCP service (`learningfocused-mcp`, `allUsers` invoker, `min-instance
 EXECUTE_NOW=1 ./scripts/deploy_ingest_job.sh   # also execute once
 ```
 
-Hydrate on each job start (not audio):
+Hydrate on each job start (not audio; the old `chroma_db/` snapshot is no longer synced, since chunks live in Postgres):
 
-- `chroma_db/` (~267 MiB)
 - `transcripts/`, `segmented_transcripts/`, `combined_summaries/`
 - `substack_articles/`, `article_summaries/`
 - `youtube_videos/`, `youtube_summaries/`
 
-Then pipelines run with skip-existing. Then checksum upload of those prefixes. Then MCP roll.
+Then pipelines run with skip-existing, indexing new chunks straight into Postgres (each pipeline first checks that Postgres answers and the login can write, so nothing is downloaded or transcribed when it can't be indexed). Then checksum upload of those prefixes. No MCP roll: the MCP service reads Postgres live.
 
 ## Cloud Scheduler
 

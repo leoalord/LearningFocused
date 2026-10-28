@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from langchain_core.documents import Document
 
 EMBED_BATCH_SIZE = 100
+PREFLIGHT_STATEMENT_TIMEOUT_MS = 5000
 AUDIO_SEGMENT_TYPE = "transcript_segment"
 YOUTUBE_SEGMENT_TYPE = "youtube_transcript_segment"
 
@@ -56,15 +57,56 @@ class IndexStats:
     dry_run: bool = False
 
 
-def require_postgres() -> None:
-    """Fail before a pipeline downloads, transcribes or summarizes anything it couldn't index."""
+def require_postgres(dsn: str | None = None) -> None:
+    """Fail before a pipeline downloads, transcribes or summarizes anything it couldn't index.
+
+    A set PG_DSN is not enough: the server must answer (bounded by the connect and
+    statement timeouts), the schema must be migrated, and this login must be able to
+    write `chunks` and `documents`.
+    """
+    import psycopg
+
     from src.database import pg_store
 
-    if not pg_store.is_configured():
+    opt_out = "or pass --skip-index to run without indexing."
+    if not (dsn or pg_store.is_configured()):
         raise RuntimeError(
             "PG_DSN is not set: chunks are indexed into Postgres. Set PG_DSN "
-            "(see docs/postgres.md), or pass --skip-index to run without indexing."
+            f"(see docs/postgres.md), {opt_out}"
         )
+    try:
+        conn = pg_store.connect(dsn, autocommit=True,
+                                extra_options=f"-c statement_timeout={PREFLIGHT_STATEMENT_TIMEOUT_MS}")
+    except psycopg.Error as exc:
+        raise RuntimeError(f"Postgres is unreachable ({type(exc).__name__}: {exc}). Fix PG_DSN, {opt_out}") from exc
+    try:
+        row = conn.execute(
+            "SELECT to_regclass('public.chunks') IS NOT NULL AND to_regclass('public.documents') IS NOT NULL, "
+            "current_setting('transaction_read_only') = 'on'"
+        ).fetchone()
+        migrated, read_only = (bool(row[0]), bool(row[1])) if row else (False, False)
+        if not migrated:
+            raise RuntimeError(
+                f"Postgres has no chunks/documents tables: run `python -m src.database.pg_store migrate`, {opt_out}"
+            )
+        writable = False
+        if not read_only:
+            # has_table_privilege with a list is true when *any* privilege is held, so check each.
+            priv = conn.execute(
+                "SELECT bool_and(has_table_privilege(t, p)) "
+                "FROM unnest(ARRAY['public.chunks', 'public.documents']) t, "
+                "unnest(ARRAY['SELECT', 'INSERT', 'UPDATE', 'DELETE']) p"
+            ).fetchone()
+            writable = bool(priv and priv[0])
+        if not writable:
+            raise RuntimeError(
+                f"Postgres login {conn.info.user!r} cannot write chunks/documents (read-only role or "
+                f"transaction). Use the ingest writer's PG_DSN, {opt_out}"
+            )
+    except psycopg.Error as exc:
+        raise RuntimeError(f"Postgres preflight failed ({type(exc).__name__}: {exc}), {opt_out}") from exc
+    finally:
+        conn.close()
 
 
 def collect_documents(
@@ -172,7 +214,11 @@ def prune_type(
     max_fraction: float,
     stats: IndexStats,
 ) -> None:
-    """Delete `doc_type` chunks not in `keep`, then documents left with no chunks."""
+    """Delete `doc_type` chunks not in `keep`, then those chunks' documents if left with no chunks.
+
+    Only documents this prune emptied are removed: other documents without chunks (an
+    article not yet indexed, say) are not this prune's to delete.
+    """
     if not keep:
         _skip_prune(stats, f"no {doc_type} rows were collected")
         return
@@ -189,10 +235,18 @@ def prune_type(
         ))
         return
     with conn.cursor() as cur:
-        cur.execute("DELETE FROM chunks WHERE type = %s AND NOT (id = ANY(%s))", (doc_type, keep_list))
-        stats.chunks_pruned += max(cur.rowcount, 0)
-        cur.execute("DELETE FROM documents d WHERE NOT EXISTS (SELECT 1 FROM chunks c WHERE c.doc_id = d.doc_id)")
-        stats.documents_pruned += max(cur.rowcount, 0)
+        cur.execute("DELETE FROM chunks WHERE type = %s AND NOT (id = ANY(%s)) RETURNING doc_id",
+                    (doc_type, keep_list))
+        deleted = cur.fetchall()
+        stats.chunks_pruned += len(deleted)
+        affected = sorted({r[0] for r in deleted if r[0] is not None})
+        if affected:
+            cur.execute(
+                "DELETE FROM documents d WHERE d.doc_id = ANY(%s) "
+                "AND NOT EXISTS (SELECT 1 FROM chunks c WHERE c.doc_id = d.doc_id)",
+                (affected,),
+            )
+            stats.documents_pruned += max(cur.rowcount, 0)
     conn.commit()
 
 
