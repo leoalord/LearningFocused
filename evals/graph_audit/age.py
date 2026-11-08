@@ -1,6 +1,7 @@
 """Read the served knowledge graph (Postgres Apache AGE) for the audit. Read-only.
 
-Graph shape follows `src/database/neo4j_to_age.py`: each node has one AGE label and
+Graph shape follows `src/database/age_graph.py` (extraction) and `src/database/neo4j_to_age.py`
+(the one-off Neo4j copy), which write it the same way: each node has one AGE label and
 keeps every original type label in a `labels` property; source passages are
 `Document` nodes linked to entities by `MENTIONS`; relationship properties (including
 `source_doc_id` from extraction) are copied as-is.

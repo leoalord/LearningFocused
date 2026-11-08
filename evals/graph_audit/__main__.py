@@ -8,8 +8,8 @@ Usage:
     uv run python -m evals.graph_audit label  --in evals/graph_audit/runs/sample.jsonl
     uv run python -m evals.graph_audit score  --in evals/graph_audit/runs/sample.jsonl
 
-`health` and `sample` read the served graph in Postgres AGE (read-only, `PG_DSN`).
-`drops` reads the extraction ingest registry, which is still in Neo4j.
+`health` and `sample` read the served graph in Postgres AGE, and `drops` the
+`ingested_docs` extraction registry next to it (all read-only, `PG_DSN`).
 `audit` calls a hosted LLM (billed).
 `label` and `score` are local only. Each command rewrites the JSONL in place, so
 auditor results and human labels accumulate on the same records.
@@ -92,26 +92,43 @@ def cmd_health(args: argparse.Namespace) -> int:
 
 # ---------- drops ----------
 
+def drop_report(conn: Any, top: int = 10) -> dict[str, Any]:
+    """Schema-filter drop totals from `ingested_docs` (src/pipeline/index_graph.py)."""
+    row = conn.execute(
+        """
+        SELECT count(*), coalesce(sum(raw_nodes), 0), coalesce(sum(kept_nodes), 0), coalesce(sum(raw_rels), 0),
+               coalesce(sum(kept_rels), 0), coalesce(sum(rels_dropped_for_endpoint), 0)
+        FROM ingested_docs WHERE raw_nodes IS NOT NULL
+        """
+    ).fetchone()
+    keys = ("docs", "raw_nodes", "kept_nodes", "raw_rels", "kept_rels", "endpoint_drops")
+    report: dict[str, Any] = dict(zip(keys, (int(v) for v in row)))
+    for column in ("dropped_node_types", "dropped_rel_types"):
+        report[column] = [
+            (str(t), int(n)) for t, n in conn.execute(
+                f"SELECT e.key, sum(e.value::int) AS n FROM ingested_docs d, jsonb_each_text(d.{column}) e "  # noqa: S608
+                "GROUP BY e.key ORDER BY n DESC, e.key LIMIT %s",
+                (top,),
+            ).fetchall()
+        ]
+    report["by_model"] = [
+        {"model": m, "docs": int(d), "raw": int(r), "kept": int(k)}
+        for m, d, r, k in conn.execute(
+            "SELECT extract_model, count(*), coalesce(sum(raw_rels), 0), coalesce(sum(kept_rels), 0) "
+            "FROM ingested_docs WHERE raw_rels IS NOT NULL GROUP BY 1 ORDER BY 2 DESC, 1"
+        ).fetchall()
+    ]
+    return report
+
+
 def cmd_drops(args: argparse.Namespace) -> int:
-    """Schema-filter drop accounting from the extraction ingest registry (Neo4j `IngestedDoc`).
+    """Schema-filter drop accounting from the `ingested_docs` extraction registry (Postgres)."""
+    from src.database.pg_search import read_only
 
-    The registry is written where extraction runs, which is still Neo4j; neo4j_to_age
-    does not copy it into AGE.
-    """
-    from src.database.neo4j_manager import get_graph
-
-    g = get_graph()
-    rows = g.query(
-        """
-        MATCH (d:IngestedDoc) WHERE d.raw_nodes IS NOT NULL
-        RETURN count(d) AS docs, sum(d.raw_nodes) AS raw_nodes, sum(d.kept_nodes) AS kept_nodes,
-               sum(d.raw_rels) AS raw_rels, sum(d.kept_rels) AS kept_rels,
-               sum(d.rels_dropped_for_endpoint) AS endpoint_drops
-        """
-    )
-    r = rows[0] if rows else {}
-    if not r.get("docs"):
-        print("No documents with extraction stats yet. Re-run graph extraction to collect them.")
+    with read_only(args.dsn) as conn:
+        r = drop_report(conn, top=args.top)
+    if not r["docs"]:
+        print("No documents with extraction stats yet. Run graph extraction (src.pipeline.index_graph) to collect them.")
         return 0
 
     def frac(a: int, b: int) -> str:
@@ -121,25 +138,9 @@ def cmd_drops(args: argparse.Namespace) -> int:
     print(f"Nodes kept:         {frac(r['kept_nodes'], r['raw_nodes'])}")
     print(f"Relationships kept: {frac(r['kept_rels'], r['raw_rels'])}")
     print(f"  dropped because an endpoint type was off-vocabulary: {r['endpoint_drops']}")
-    for label, prop in (("node", "dropped_node_types"), ("relationship", "dropped_rel_types")):
-        top = g.query(
-            f"""
-            MATCH (d:IngestedDoc) WHERE d.{prop} IS NOT NULL
-            UNWIND d.{prop} AS entry
-            WITH split(entry, ':') AS parts
-            WITH parts[0] AS t, toInteger(parts[size(parts)-1]) AS c
-            RETURN t, sum(c) AS n ORDER BY n DESC LIMIT $k
-            """,
-            params={"k": args.top},
-        )
-        print(f"Top off-vocabulary {label} types: " + (", ".join(f"{x['t']}x{x['n']}" for x in top) or "none"))
-    for m in g.query(
-        """
-        MATCH (d:IngestedDoc) WHERE d.raw_rels IS NOT NULL
-        RETURN d.extract_model AS model, count(d) AS docs, sum(d.raw_rels) AS raw, sum(d.kept_rels) AS kept
-        ORDER BY docs DESC
-        """
-    ):
+    for label, key in (("node", "dropped_node_types"), ("relationship", "dropped_rel_types")):
+        print(f"Top off-vocabulary {label} types: " + (", ".join(f"{t}x{n}" for t, n in r[key]) or "none"))
+    for m in r["by_model"]:
         print(f"  model={m['model']}: docs={m['docs']} rels kept {frac(m['kept'], m['raw'])}")
     return 0
 
@@ -281,8 +282,9 @@ def main(argv: list[str] | None = None) -> int:
     h.add_argument("--dsn", help="Postgres DSN; default PG_DSN.")
     h.set_defaults(func=cmd_health)
 
-    dr = sub.add_parser("drops", help="Schema-filter drop accounting from the extraction registry (Neo4j).")
+    dr = sub.add_parser("drops", help="Schema-filter drop accounting from the ingested_docs registry (Postgres).")
     dr.add_argument("--top", type=int, default=10)
+    dr.add_argument("--dsn", help="Postgres DSN; default PG_DSN.")
     dr.set_defaults(func=cmd_drops)
 
     s = sub.add_parser("sample", help="Random sample of entity relationships with source evidence.")
