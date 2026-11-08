@@ -2,12 +2,15 @@
 
 Usage:
     uv run python -m evals.graph_audit health
+    uv run python -m evals.graph_audit drops
     uv run python -m evals.graph_audit sample --n 100 --out evals/graph_audit/runs/sample.jsonl
     uv run python -m evals.graph_audit audit  --in evals/graph_audit/runs/sample.jsonl
     uv run python -m evals.graph_audit label  --in evals/graph_audit/runs/sample.jsonl
     uv run python -m evals.graph_audit score  --in evals/graph_audit/runs/sample.jsonl
 
-`health` and `sample` read Neo4j (read-only). `audit` calls a hosted LLM (billed).
+`health` and `sample` read the served graph in Postgres AGE (read-only, `PG_DSN`).
+`drops` reads the extraction ingest registry, which is still in Neo4j.
+`audit` calls a hosted LLM (billed).
 `label` and `score` are local only. Each command rewrites the JSONL in place, so
 auditor results and human labels accumulate on the same records.
 """
@@ -17,7 +20,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import random
 import sys
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -25,17 +27,14 @@ from typing import Any, Mapping, Sequence
 from evals.graph_audit.scoring import (
     DEFAULT_TYPE_DEFINITIONS,
     build_audit_input,
-    excerpt_around,
     format_report,
     parse_auditor_json,
     score_records,
-    strip_extraction_preamble,
 )
 
 HERE = Path(__file__).resolve().parent
 PROMPT_PATH = HERE / "auditor_prompt.md"
 DEFAULT_OUT = HERE / "runs" / "sample.jsonl"
-BASE_LABELS = {"__Entity__", "__KGBuilder__"}
 
 
 # ---------- io ----------
@@ -64,17 +63,44 @@ def _type_definitions(path: str | None) -> dict[str, str]:
     return dict(DEFAULT_TYPE_DEFINITIONS)
 
 
-def _graph() -> Any:
-    from src.database.neo4j_manager import get_graph
-
-    return get_graph()
-
-
 # ---------- health ----------
 
 def cmd_health(args: argparse.Namespace) -> int:
-    g = _graph()
-    print("=== Extraction drop accounting (IngestedDoc, runs after this change) ===")
+    """Shape of the served graph (Postgres AGE). Works on graphs built before provenance."""
+    from evals.graph_audit.age import graph_shape
+    from src.database.pg_search import read_only
+
+    with read_only(args.dsn) as conn:
+        shape = graph_shape(conn, top=args.top)
+    t, c = shape["entities"], shape["conflicted"]
+    if not t:
+        print("The AGE graph has no entities.")
+        return 0
+    print("=== Served graph (Postgres AGE) ===")
+    print(f"Entities: {t}; carrying more than one type label: {c} ({c / t:.1%})")
+    print("Type labels: " + ", ".join(f"{k}x{v}" for k, v in shape["type_label_counts"].items()))
+    for e in shape["examples"]:
+        print(f"  {e['name']}: {e['types']} (degree {e['degree']})")
+    total = sum(r["count"] for r in shape["relationships"])
+    print(f"Entity relationships: {total}")
+    for r in shape["relationships"]:
+        share = r["count"] / total if total else 0
+        print(f"  {r['type']:20s} {r['count']:>7d} ({share:.0%})  with source_doc_id: {r['with_provenance']}")
+    print("\nExtraction drop counts live in the ingest registry; see `drops`.")
+    return 0
+
+
+# ---------- drops ----------
+
+def cmd_drops(args: argparse.Namespace) -> int:
+    """Schema-filter drop accounting from the extraction ingest registry (Neo4j `IngestedDoc`).
+
+    The registry is written where extraction runs, which is still Neo4j; neo4j_to_age
+    does not copy it into AGE.
+    """
+    from src.database.neo4j_manager import get_graph
+
+    g = get_graph()
     rows = g.query(
         """
         MATCH (d:IngestedDoc) WHERE d.raw_nodes IS NOT NULL
@@ -86,145 +112,59 @@ def cmd_health(args: argparse.Namespace) -> int:
     r = rows[0] if rows else {}
     if not r.get("docs"):
         print("No documents with extraction stats yet. Re-run graph extraction to collect them.")
-    else:
-        def frac(a: int, b: int) -> str:
-            return f"{a}/{b} ({a / b:.0%})" if b else "n/a"
+        return 0
 
-        print(f"Documents with stats: {r['docs']}")
-        print(f"Nodes kept:         {frac(r['kept_nodes'], r['raw_nodes'])}")
-        print(f"Relationships kept: {frac(r['kept_rels'], r['raw_rels'])}")
-        print(f"  dropped because an endpoint type was off-vocabulary: {r['endpoint_drops']}")
-        for label, prop in (("node", "dropped_node_types"), ("relationship", "dropped_rel_types")):
-            top = g.query(
-                f"""
-                MATCH (d:IngestedDoc) WHERE d.{prop} IS NOT NULL
-                UNWIND d.{prop} AS entry
-                WITH split(entry, ':') AS parts
-                WITH parts[0] AS t, toInteger(parts[size(parts)-1]) AS c
-                RETURN t, sum(c) AS n ORDER BY n DESC LIMIT $k
-                """,
-                params={"k": args.top},
-            )
-            print(f"Top off-vocabulary {label} types: " + (", ".join(f"{x['t']}x{x['n']}" for x in top) or "none"))
-        by_model = g.query(
-            """
-            MATCH (d:IngestedDoc) WHERE d.raw_rels IS NOT NULL
-            RETURN d.extract_model AS model, count(d) AS docs, sum(d.raw_rels) AS raw, sum(d.kept_rels) AS kept
-            ORDER BY docs DESC
-            """
-        )
-        for m in by_model:
-            print(f"  model={m['model']}: docs={m['docs']} rels kept {frac(m['kept'], m['raw'])}")
+    def frac(a: int, b: int) -> str:
+        return f"{a}/{b} ({a / b:.0%})" if b else "n/a"
 
-    print("\n=== Graph shape (works on existing graphs) ===")
-    multi = g.query(
-        """
-        MATCH (n:__Entity__)
-        WITH n, [l IN labels(n) WHERE NOT l IN $base] AS types
-        WITH count(n) AS total, sum(CASE WHEN size(types) > 1 THEN 1 ELSE 0 END) AS conflicted
-        RETURN total, conflicted
-        """,
-        params={"base": sorted(BASE_LABELS)},
-    )
-    if multi and multi[0]["total"]:
-        t, c = multi[0]["total"], multi[0]["conflicted"]
-        print(f"Entities: {t}; carrying more than one type label: {c} ({c / t:.1%})")
-        examples = g.query(
-            """
-            MATCH (n:__Entity__)
-            WITH n, [l IN labels(n) WHERE NOT l IN $base] AS types
-            WHERE size(types) > 1
-            RETURN n.id AS id, types, COUNT { (n)--() } AS degree
-            ORDER BY degree DESC LIMIT $k
+    print(f"Documents with stats: {r['docs']}")
+    print(f"Nodes kept:         {frac(r['kept_nodes'], r['raw_nodes'])}")
+    print(f"Relationships kept: {frac(r['kept_rels'], r['raw_rels'])}")
+    print(f"  dropped because an endpoint type was off-vocabulary: {r['endpoint_drops']}")
+    for label, prop in (("node", "dropped_node_types"), ("relationship", "dropped_rel_types")):
+        top = g.query(
+            f"""
+            MATCH (d:IngestedDoc) WHERE d.{prop} IS NOT NULL
+            UNWIND d.{prop} AS entry
+            WITH split(entry, ':') AS parts
+            WITH parts[0] AS t, toInteger(parts[size(parts)-1]) AS c
+            RETURN t, sum(c) AS n ORDER BY n DESC LIMIT $k
             """,
-            params={"base": sorted(BASE_LABELS), "k": args.top},
+            params={"k": args.top},
         )
-        for e in examples:
-            print(f"  {e['id']}: {e['types']} (degree {e['degree']})")
-    rels = g.query(
+        print(f"Top off-vocabulary {label} types: " + (", ".join(f"{x['t']}x{x['n']}" for x in top) or "none"))
+    for m in g.query(
         """
-        MATCH (:__Entity__)-[r]->(:__Entity__)
-        RETURN type(r) AS t, count(r) AS n,
-               sum(CASE WHEN r.source_doc_id IS NULL THEN 0 ELSE 1 END) AS with_provenance
-        ORDER BY n DESC
+        MATCH (d:IngestedDoc) WHERE d.raw_rels IS NOT NULL
+        RETURN d.extract_model AS model, count(d) AS docs, sum(d.raw_rels) AS raw, sum(d.kept_rels) AS kept
+        ORDER BY docs DESC
         """
-    )
-    total = sum(x["n"] for x in rels)
-    print(f"Entity relationships: {total}")
-    for x in rels:
-        print(f"  {x['t']:20s} {x['n']:>7d} ({x['n'] / total:.0%})  with source_doc_id: {x['with_provenance']}")
+    ):
+        print(f"  model={m['model']}: docs={m['docs']} rels kept {frac(m['kept'], m['raw'])}")
     return 0
 
 
 # ---------- sample ----------
 
-_FETCH = """
-UNWIND $ids AS rid
-MATCH (a)-[r]->(b) WHERE elementId(r) = rid
-OPTIONAL MATCH (d:Document {id: r.source_doc_id})
-RETURN rid, a.id AS subject, [l IN labels(a) WHERE NOT l IN $base] AS subject_types,
-       type(r) AS predicate, b.id AS object, [l IN labels(b) WHERE NOT l IN $base] AS object_types,
-       properties(r) AS rprops,
-       CASE WHEN d IS NULL THEN null ELSE {id: d.id, text: d.text, title: d.title} END AS edge_doc,
-       CASE WHEN d IS NULL THEN
-         [(c:Document)-[:MENTIONS]->(a) WHERE (c)-[:MENTIONS]->(b) | {id: c.id, text: c.text, title: c.title}][..$k]
-       ELSE [] END AS co_docs
-"""
-
-
 def cmd_sample(args: argparse.Namespace) -> int:
-    g = _graph()
-    where = "type(r) <> 'MENTIONS'"
-    params: dict[str, Any] = {}
-    if args.predicate:
-        where += " AND type(r) IN $preds"
-        params["preds"] = args.predicate
-    ids = [row["rid"] for row in g.query(
-        f"MATCH (:__Entity__)-[r]->(:__Entity__) WHERE {where} RETURN elementId(r) AS rid", params=params
-    )]
-    if not ids:
-        print("No entity relationships found.", file=sys.stderr)
-        return 2
-    rng = random.Random(args.seed)
-    chosen = rng.sample(ids, min(args.n, len(ids)))
-    rows = g.query(_FETCH, params={"ids": chosen, "base": sorted(BASE_LABELS), "k": args.max_docs})
+    from evals.graph_audit.age import sample_claims
 
-    records: list[dict[str, Any]] = []
-    for row in rows:
-        names = [row["subject"], row["object"]]
-        if row["edge_doc"]:
-            provenance, docs = "edge", [row["edge_doc"]]
-        elif row["co_docs"]:
-            provenance, docs = "co_mention", row["co_docs"]
-        else:
-            provenance, docs = "none", []
-        evidence = []
-        for d in docs:
-            text, truncated = excerpt_around(strip_extraction_preamble(d.get("text") or ""), names, args.max_chars)
-            evidence.append({"evidence_id": d["id"], "title": d.get("title"), "text": text, "truncated": truncated})
-        records.append({
-            "claim_id": row["rid"],
-            "subject": row["subject"],
-            "subject_types": row["subject_types"],
-            "predicate": row["predicate"],
-            "object": row["object"],
-            "object_types": row["object_types"],
-            "type_conflict": len(row["subject_types"]) > 1 or len(row["object_types"]) > 1,
-            "relationship_properties": row["rprops"],
-            "provenance": provenance,
-            "evidence": evidence,
-            "auditor": None,
-            "human": None,
-        })
     out = Path(args.out)
     if out.exists() and not args.force:
         print(f"{out} exists; pass --force to overwrite (it may hold labels).", file=sys.stderr)
+        return 2
+    records, population = sample_claims(
+        n=args.n, seed=args.seed, predicates=args.predicate,
+        max_docs=args.max_docs, max_chars=args.max_chars, dsn=args.dsn,
+    )
+    if not records:
+        print("No entity relationships found in the AGE graph.", file=sys.stderr)
         return 2
     _save(out, records)
     prov: dict[str, int] = {}
     for r in records:
         prov[r["provenance"]] = prov.get(r["provenance"], 0) + 1
-    print(f"Sampled {len(records)} of {len(ids)} relationships (seed={args.seed}) -> {out}")
+    print(f"Sampled {len(records)} of {population} relationships (seed={args.seed}) -> {out}")
     print(f"Provenance: {prov}  (edge = exact source doc; co_mention = docs mentioning both, pre-provenance data)")
     return 0
 
@@ -336,9 +276,14 @@ def main(argv: list[str] | None = None) -> int:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    h = sub.add_parser("health", help="Drop accounting + graph shape (read-only Neo4j).")
+    h = sub.add_parser("health", help="Served graph shape: type conflicts, edge mix, provenance (AGE).")
     h.add_argument("--top", type=int, default=10)
+    h.add_argument("--dsn", help="Postgres DSN; default PG_DSN.")
     h.set_defaults(func=cmd_health)
+
+    dr = sub.add_parser("drops", help="Schema-filter drop accounting from the extraction registry (Neo4j).")
+    dr.add_argument("--top", type=int, default=10)
+    dr.set_defaults(func=cmd_drops)
 
     s = sub.add_parser("sample", help="Random sample of entity relationships with source evidence.")
     s.add_argument("--n", type=int, default=100)
@@ -348,6 +293,7 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--max-chars", type=int, default=6000, help="Excerpt length per evidence document.")
     s.add_argument("--out", default=str(DEFAULT_OUT))
     s.add_argument("--force", action="store_true")
+    s.add_argument("--dsn", help="Postgres DSN; default PG_DSN.")
     s.set_defaults(func=cmd_sample)
 
     a = sub.add_parser("audit", help="Run the LLM auditor over a sample (billed).")
