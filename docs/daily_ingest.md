@@ -2,7 +2,7 @@
 
 One Cloud Run **Job** (not the public MCP service) checks every feed in [`src/feeds/sources.json`](feeds.md) that is due: Art19 RSS, Substack and the whole `@future_of_education` YouTube channel daily, social accounts once configured. Failures are isolated per source. Each source embeds its new and changed chunks straight into Postgres (`src/pipeline/index_pg.py`), where `learningfocused-mcp` reads them live, so the job needs `PG_DSN`. A run ledger is written every time. After ingest, the derived text artifacts are checksum-synced to `gs://learningfocused-corpus`. Chroma is no longer written; the old `chroma_db/` snapshot in the bucket is left as it was.
 
-Does **not** re-transcribe existing files, take more than `max_new_per_run` new YouTube videos per run, ingest `@thealphaschool` / UU dumps / Shorts-tab dumps, wipe Neo4j, or touch the MCP service. Graph/Neo4j is skipped in the job (no Docker/Aura on Cloud Run).
+Does **not** re-transcribe existing files, take more than `max_new_per_run` new YouTube videos per run, ingest `@thealphaschool` / UU dumps / Shorts-tab dumps, or touch the MCP service. LLM graph extraction is off unless you turn it on (below); Neo4j is not used.
 
 Project is LearningFocus (`gen-lang-client-0304733057`, the scripts' default; `GCP_BACKUP_PROJECT` overrides it, see `scripts/_gcp_env.sh`) / `us-west1`. Do not deploy to `inferpoker`; that project belongs to InferPoker.
 
@@ -20,17 +20,21 @@ uv run python -m src.pipeline.daily_ingest
 | `--source KEY` | Run only this registry key, due or not (repeatable) |
 | `--skip KEY` | Skip a registry key (repeatable) |
 | `--skip-art19` / `--skip-substack` / `--skip-youtube` | Shorthands for `--skip` |
+| `--graph` | Also run LLM graph extraction into the Postgres AGE graph after the sources (billed; default off; `DAILY_GRAPH_EXTRACT=1` does the same) |
+| `--graph-max-docs N` | Most new passages sent to the LLM per run (default 100; `DAILY_GRAPH_MAX_DOCS`) |
 
 Isolation: each source is wrapped in `try/except`. Art19 raising does not skip Substack or YouTube. The process still writes the ledger and attempts the GCS sync.
 
-Wrapped runners (Neo4j always skipped; `--force` off). Limits come from each source's `config` in `sources.json`; a bad value fails only that source.
+Wrapped runners (graph extraction skipped inside each one; `--force` off). Limits come from each source's `config` in `sources.json`; a bad value fails only that source.
 
-- `podcast_rss` (Art19): `python -m src.pipeline.audio.run --skip-neo4j -- --mode daily --download-limit <download_limit>` (`DAILY_ART19_DOWNLOAD_LIMIT` env overrides)
-- `substack`: `python -m src.pipeline.substack.run --skip-neo4j -- --mode daily --ingest-limit <ingest_limit>`
+- `podcast_rss` (Art19): `python -m src.pipeline.audio.run --skip-graph -- --mode daily --download-limit <download_limit>` (`DAILY_ART19_DOWNLOAD_LIMIT` env overrides)
+- `substack`: `python -m src.pipeline.substack.run --skip-graph -- --mode daily --ingest-limit <ingest_limit>`
 - `youtube_channel`: `python -m src.pipeline.youtube.run --feed --max-new <max_new_per_run>` (videos tab + the two playlists, deduplicated against podcast episodes by `skip.py`; any failed video fails this source, and a video that fails 3 runs is set aside, see [feeds.md](feeds.md))
 - `instagram` / `x` / `linkedin` / `tiktok`: `src/feeds/social.py` (skipped until accounts and a credential are set)
 
 If `sources.json` can't be parsed, the job logs the error and runs the three core feeds anyway.
+
+**Graph extraction (opt-in).** With `--graph`, one step after the sources runs `src/pipeline/index_graph.py` over every audio segment and Substack article whose current text hasn't been extracted yet (bookkeeping in the `ingested_docs` table), up to `--graph-max-docs` passages; the rest wait for the next run. It uses the hosted models in `LF_NEO4J_GRAPH_MODELS` (the job already has the Google, Anthropic, OpenAI and Fireworks keys) and writes straight into the AGE graph the MCP server reads ([postgres.md](postgres.md)). It is recorded under `graph` in the ledger (`docs_processed`, `deferred`, drop counts, vertices and edges written); a failed batch makes the step and the run `ok: false` without affecting the sources, and is retried next run. To enable it on the scheduled job, add `DAILY_GRAPH_EXTRACT=1` (and optionally `DAILY_GRAPH_MAX_DOCS`) to the job's environment.
 
 Audio download skips an MP3 when the matching transcript already exists, so the job can hydrate transcripts (~9 MiB) instead of `podcast_downloads/` (~6 GiB). A **new** RSS episode has no transcript, so it is downloaded and sent to AssemblyAI.
 
@@ -42,7 +46,7 @@ Every run writes:
 - `gs://learningfocused-corpus/ingest_ledger/<run_id>.json`
 - `gs://learningfocused-corpus/ingest_ledger/latest.json`
 
-Fields: `started_at` / `finished_at`, per-source `ok` / `error`, hydrate counts, GCS upload stats, `pg_state`.
+Fields: `started_at` / `finished_at`, per-source `ok` / `error`, hydrate counts, `graph` (skipped unless `--graph`), GCS upload stats, `pg_state`.
 
 The run also mirrors `sources.json` into the `sources` table, reads each source's last check (for weekly cadence), and writes `ingest_runs` + `source_checks`. A bookkeeping error is recorded under `pg_state` and never fails the run. Indexing is part of each source: if Postgres is unreachable, that source fails, and the next run catches up (every run compares the whole on-disk corpus with Postgres; unchanged chunks are not re-embedded).
 

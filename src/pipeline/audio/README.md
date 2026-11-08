@@ -5,10 +5,10 @@ Canonical implementation for the podcast/audio workflow.
 ### Design (how to read this package)
 
 - `process_all.py` is the **processing-only** runner (files in → files out).
-- `run.py` is the **orchestrator** that calls `process_all`, then optionally runs indexing (Chroma/Neo4j).
+- `run.py` is the **orchestrator** that calls `process_all`, then optionally indexes into Postgres (chunks + embeddings, then LLM graph extraction into the AGE graph).
 - Indexing logic is split:
-  - Pipeline-owned “what to index”: `index_chroma.py`, `index_neo4j.py`
-  - DB-owned “how to store/query”: `src/database/chroma_manager.py`, `src/database/neo4j_manager.py`
+  - Pipeline-owned “what to index”: `index_chroma.py`, `index_neo4j.py` (passages for graph extraction; the name is historical)
+  - Shared indexers: `src/pipeline/index_pg.py` (chunks) and `src/pipeline/index_graph.py` (graph, written by `src/database/age_graph.py`)
 
 ### Full pipeline
 
@@ -18,20 +18,20 @@ The canonical runner is `src.pipeline.audio.run`:
 uv run python -m src.pipeline.audio.run
 ```
 
-To skip indexing (Chroma/Neo4j) and only produce files:
+To skip indexing and only produce files:
 
 ```bash
-uv run python -m src.pipeline.audio.run --skip-chroma --skip-neo4j
+uv run python -m src.pipeline.audio.run --skip-index --skip-graph
 ```
 
-### Neo4j schema profile (graph extraction)
+### Graph extraction (Postgres AGE)
 
-By default the Neo4j graph extraction uses the **extended** relationship schema (good for learning science + research expansion).
+Unless `--skip-graph` (old name `--skip-neo4j` still works), the runner sends new or changed transcript segments through LLM graph extraction and writes the result into the Postgres AGE graph `knowledge` (billed; needs `PG_DSN`, no Neo4j). In daily mode it is skipped when the run produced no new transcripts, unless `--run-graph-without-new-transcripts`. `--graph-audio-limit N` reads only the first N transcripts. See `docs/postgres.md`.
 
-If you want a smaller MVP relationship set for a run:
+By default extraction uses the **extended** relationship schema (good for learning science + research expansion). For a smaller relationship set:
 
 ```bash
-uv run python -m src.pipeline.audio.run --neo4j-schema-profile core
+uv run python -m src.pipeline.audio.run --graph-schema-profile core
 ```
 
 ### Standalone audio orchestrator

@@ -1,6 +1,6 @@
 """Neo4j graph extraction LLM configuration.
 
-This is used by `src/pipeline/index_neo4j.py` during `LLMGraphTransformer` conversion.
+This is used by `src/pipeline/index_graph.py` during `LLMGraphTransformer` conversion.
 
 Environment variables:
 - LF_NEO4J_GRAPH_MODELS (comma-separated; primary + fallbacks)

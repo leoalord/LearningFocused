@@ -14,7 +14,6 @@ from typing import Sequence
 from dotenv import load_dotenv
 
 from src.config import ensure_data_dirs
-from src.pipeline.index_neo4j import update_knowledge_graph
 from src.pipeline.substack import process_all
 
 def build_parser() -> argparse.ArgumentParser:
@@ -25,18 +24,23 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--skip-processing", action="store_true", help="Skip ingest + summaries.")
     p.add_argument("--skip-index", "--skip-chroma", dest="skip_index", action="store_true",
                    help="Skip updating the Postgres chunks and embeddings.")
-    p.add_argument("--skip-neo4j", action="store_true", help="Skip updating the Neo4j knowledge graph.")
+    p.add_argument("--skip-graph", "--skip-neo4j", dest="skip_graph", action="store_true",
+                   help="Skip LLM graph extraction into the Postgres AGE graph (billed LLM work).")
     p.add_argument(
+        "--graph-schema-profile",
         "--neo4j-schema-profile",
+        dest="graph_schema_profile",
         choices=["core", "extended"],
         default=None,
-        help="Neo4j relationship schema profile (defaults to extended).",
+        help="Relationship schema profile (defaults to extended).",
     )
     p.add_argument(
+        "--graph-article-limit",
         "--neo4j-article-limit",
+        dest="graph_article_limit",
         type=int,
         default=None,
-        help="Max number of Substack article Documents to transform/write to Neo4j (test runs).",
+        help="Max number of Substack article Documents to send through graph extraction (test runs).",
     )
     p.add_argument(
         "process_all_args",
@@ -68,14 +72,16 @@ def main(argv: Sequence[str] | None = None) -> None:
         # Substack runs should default to indexing only Substack docs to keep runs scoped and cheap.
         update_pg_index(include_audio=False, include_articles=True, include_youtube=False)
 
-    if not args.skip_neo4j:
+    if not args.skip_graph:
+        from src.pipeline.index_graph import update_knowledge_graph
+
         # For Substack runs, default to indexing only articles (not audio) to keep test runs fast and scoped.
         update_knowledge_graph(
             include_audio=False,
             include_articles=True,
             audio_limit=None,
-            article_limit=args.neo4j_article_limit,
-            schema_profile=args.neo4j_schema_profile,
+            article_limit=args.graph_article_limit,
+            schema_profile=args.graph_schema_profile,
         )
 
 

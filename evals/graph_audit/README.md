@@ -13,17 +13,22 @@ checks the LLM auditor against blind human labels so you know how far to trust i
 
 ## What the pipeline records now
 
-`src/pipeline/index_neo4j.py` runs `LLMGraphTransformer` with `strict_mode=False`
+`src/pipeline/index_graph.py` runs `LLMGraphTransformer` with `strict_mode=False`
 and filters in `src/pipeline/graph_quality.py` so every drop is counted:
 
 | Where | Field | Meaning |
 | --- | --- | --- |
-| `IngestedDoc` | `raw_nodes` / `kept_nodes`, `raw_rels` / `kept_rels` | What the model proposed vs what passed the schema filter |
-| `IngestedDoc` | `dropped_node_types`, `dropped_rel_types` | Off-vocabulary types, as `"Type:count"` strings |
-| `IngestedDoc` | `rels_dropped_for_endpoint`, `extract_model` | Edges lost because an endpoint was dropped; which model in the fallback chain ran |
-| entity relationships | `source_doc_id`, `extract_model`, `ingest_run_id` | The `Document.id` the edge was first extracted from (set on create) |
+| `ingested_docs` table | `raw_nodes` / `kept_nodes`, `raw_rels` / `kept_rels` | What the model proposed vs what passed the schema filter |
+| `ingested_docs` table | `dropped_node_types`, `dropped_rel_types` | Off-vocabulary types, as JSON (`{"Place": 3}`) |
+| `ingested_docs` table | `rels_dropped_for_endpoint`, `extract_model` | Edges lost because an endpoint was dropped; which model in the fallback chain ran |
+| entity relationships (AGE) | `source_doc_id`, `extract_model`, `ingest_run_id` | The `Document.id` the edge was first extracted from (set on create) |
 
 Each batch also logs a `schema filter:` line, and the run ends with totals.
+
+Extraction now writes to the Postgres AGE graph and the `ingested_docs` table
+(`docs/postgres.md`). `health` and `sample` below still read Neo4j, so they see
+only graphs built before that change; query `ingested_docs` for drop rates of
+newer runs.
 
 Graphs built before this change have none of these fields. `health` still
 reports graph shape for them, and `sample` falls back to documents that mention

@@ -13,7 +13,7 @@ Build a queryable knowledge base from a corpus of podcast audio + transcripts + 
 - **GCS backup** (off-laptop; one private bucket): see `docs/gcs_backup.md`
 - **Chroma**: embeddings for transcript segments + summary-like docs + Substack text/summaries
 - **Neo4j**: graph extraction over Documents (good for “what’s connected to what?”)
-- **Postgres** (pgvector + Apache AGE + full-text, one small VM): the replacement for Chroma and Neo4j, filled from both and kept in step daily; see `docs/postgres.md`
+- **Postgres** (pgvector + Apache AGE + full-text, one small VM): the replacement for Chroma and Neo4j. Chunks are written there daily, and LLM graph extraction writes straight into its AGE graph (`src/pipeline/index_graph.py`); see `docs/postgres.md`
 
 ## Quick start
 
@@ -64,7 +64,7 @@ uv run python -m src.pipeline.audio.run
 Skip indexing (filesystem artifacts only):
 
 ```bash
-uv run python -m src.pipeline.audio.run --skip-chroma --skip-neo4j
+uv run python -m src.pipeline.audio.run --skip-index --skip-graph
 ```
 
 See deeper docs: `src/pipeline/audio/README.md`.
@@ -94,10 +94,10 @@ uv run python -m src.pipeline.daily_ingest --dry-run --skip-hydrate --skip-sync
 uv run python -m src.database.chroma_manager
 ```
 
-- **Neo4j** (graph; builds/updates from pipeline artifacts):
+- **Graph** (LLM extraction from pipeline artifacts into the Postgres AGE graph; billed, needs `PG_DSN`):
 
 ```bash
-uv run python -m src.database.neo4j_manager
+uv run python -m src.pipeline.index_graph --max-docs 20
 ```
 
 ## Agents (query + research)

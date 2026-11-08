@@ -8,7 +8,7 @@ from langchain_core.documents import Document
 from langchain_neo4j.graphs.graph_document import GraphDocument, Node, Relationship
 
 from src.pipeline.graph_quality import ExtractionStats, filter_to_schema
-from src.pipeline.index_neo4j import apply_schema_and_provenance
+from src.pipeline.index_graph import apply_schema_and_provenance
 
 NODES = ["Person", "Organization", "Concept"]
 RELS = ["FOUNDED", "ADVOCATES_FOR"]

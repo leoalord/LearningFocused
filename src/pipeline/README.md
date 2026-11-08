@@ -42,6 +42,13 @@ uv run python -m src.pipeline.daily_ingest --dry-run --skip-hydrate --skip-sync
 ./scripts/deploy_ingest_job.sh
 ```
 
+- **Graph extraction** into the Postgres AGE graph (billed LLM work; no Neo4j; details in `docs/postgres.md`):
+
+```bash
+uv run python -m src.pipeline.index_graph --max-docs 20
+uv run python -m src.pipeline.daily_ingest --graph --graph-max-docs 50   # opt-in in the daily job
+```
+
 ### Notes
 
 - The audio pipeline is the current production path.

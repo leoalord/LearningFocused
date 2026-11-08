@@ -8,7 +8,7 @@ One Postgres 16 database replaces Chroma (vectors) and local Neo4j (graph), and 
 | Vector | `chunks.embedding vector(1536)` (OpenAI `text-embedding-3-small`, same as Chroma), HNSW cosine index | same |
 | Graph | Apache AGE graph `knowledge`, openCypher via `cypher()` | created by `pg_store.migrate` |
 
-Tables: `sources` (every feed the daily job checks), `documents`, `chunks`, `ingest_runs`, `source_checks`.
+Tables: `sources` (every feed the daily job checks), `documents`, `chunks`, `ingest_runs`, `source_checks`, `ingested_docs` (graph extraction bookkeeping).
 
 ## Where it runs
 
@@ -55,7 +55,7 @@ per new label, the app role must own those tables to add more labels later, and 
 role needs SELECT on them.
 ```
 
-## Filling it: Chroma backfill, daily dual-write, Neo4j graph
+## Filling it: Chroma backfill, daily writes, graph extraction
 
 **Vectors and text (from Chroma, no re-embedding).** Chroma already stores the `text-embedding-3-small` vectors, so the backfill copies them as they are:
 
@@ -77,7 +77,32 @@ PG_DSN=... uv run python -m src.pipeline.index_pg --dry-run --include-youtube   
 
 `pg_sync` above is now only the one-time backfill from an existing `chroma_db/`.
 
-**Graph (from the local Neo4j, any size).** Run on the Mac that has Neo4j, with the tunnel open:
+**Graph extraction writes straight into AGE.** `src/pipeline/index_graph.py` sends new or changed passages (audio transcript segments, Substack articles) through LangChain's `LLMGraphTransformer` with the hosted models in `LF_NEO4J_GRAPH_MODELS` (primary + fallbacks), filters the result to the schema with drop accounting (`src/pipeline/graph_quality.py`), and writes it with `src/database/age_graph.py`. No Neo4j is involved; it needs `PG_DSN` and an API key for at least one of the models. It is billed LLM work:
+
+```bash
+PG_DSN=... uv run python -m src.pipeline.index_graph --max-docs 20    # also: --no-audio, --no-articles, --schema-profile core
+```
+
+The audio and Substack runners call it unless `--skip-graph` (formerly `--skip-neo4j`, still accepted). The daily job runs it only with `--graph` or `DAILY_GRAPH_EXTRACT=1`, at most `DAILY_GRAPH_MAX_DOCS` (default 100) passages per run; see [daily_ingest.md](daily_ingest.md).
+
+What it writes is the shape `neo4j_to_age` produces, so the MCP graph tools read old and new data alike:
+
+- **Entities** merge by exact `id` across all entity labels, like Neo4j's `MERGE (:__Entity__ {id})`. AGE allows one label per vertex, so an entity keeps the label of the type it was first written with; `labels` lists every type it has been given (`["__Entity__", "Person", "Organization"]`) and `name_lc` holds the lower-cased id. An entity that appears only as a relationship end gets a vertex but no `MENTIONS` edge, as in Neo4j.
+- **`Document`** vertices hold each passage (`text`, as sent to the model, plus its metadata), keyed by `id` (md5 of the text), with a `MENTIONS` edge to every entity extracted from it.
+- **Relationships** are one edge per (source, type, target). Properties are set when the edge is created and not overwritten later, so `source_doc_id`, `extract_model` and `ingest_run_id` identify the passage and run that first produced it.
+
+Each batch (5 passages) is one LLM call and one transaction; writers take an advisory lock, so two runs can't create the same entity twice. Entity lookups are plain SQL over the label tables (milliseconds on a 100k-vertex graph).
+
+`ingested_docs` replaces Neo4j's `IngestedDoc` nodes: one row per passage version (`source_key` + `content_hash`) with `status` (`started` before the LLM call, then `completed` or `failed` with `error`), the `graph_doc_id` of its Document vertex, `extract_model`, and raw vs kept node/relationship counts with the off-vocabulary types as JSON (`{"Place": 3}`). Only `completed` rows are skipped, so failed batches are retried next run. A passage whose Document vertex is already in the graph (copied from Neo4j) is recorded as completed with a `note` instead of being extracted again. Drop rates, for example:
+
+```sql
+SELECT extract_model, count(*), sum(kept_rels)::float / nullif(sum(raw_rels), 0) AS rels_kept
+FROM ingested_docs WHERE raw_rels IS NOT NULL GROUP BY 1;
+```
+
+`uv run python -m src.pipeline.audio.run --skip-processing --skip-summaries --skip-index --delete-audio-from-graph` deletes audio Document vertices and their `ingested_docs` rows (entities stay) so audio is extracted again.
+
+**Graph (one-off copy from a local Neo4j, any size).** For moving an existing Neo4j graph into AGE. Run on the Mac that has Neo4j, with the tunnel open:
 
 ```bash
 NEO4J_URI=bolt://localhost:7687 NEO4J_USERNAME=neo4j NEO4J_PASSWORD=... \
@@ -85,7 +110,7 @@ PG_DSN=postgresql://learningfocused@localhost:6543/learningfocused \
   uv run python -m src.database.neo4j_to_age --grant-to learningfocused_app
 ```
 
-Nodes and relationships are streamed and written in batches (`--batch-size`, default 1000), each batch in its own transaction. `age_import_map` records every copied Neo4j `elementId`, so an interrupted run is finished by running it again. Don't change the Neo4j graph between an interrupted run and its re-run: Neo4j can reuse ids of deleted items, and a reused id would be taken as already copied. The script prints Neo4j's counts next to what AGE holds and exits non-zero until they match; relationships whose end nodes were not imported are reported separately, since re-running can't fix those. `IngestedDoc` bookkeeping nodes (and their relationships) are skipped. Before writing, it checks that no two Neo4j labels or relationship types reduce to the same AGE name. Each node gets one AGE label (its first label other than `__Entity__`) and keeps all its Neo4j labels in a `labels` property; `embedding` properties are dropped unless `--keep-property embedding`. `--grant-to` hands the new label tables to the app role so it can keep adding to the graph.
+Nodes and relationships are streamed and written in batches (`--batch-size`, default 1000), each batch in its own transaction. `age_import_map` records every copied Neo4j `elementId`, so an interrupted run is finished by running it again. Don't change the Neo4j graph between an interrupted run and its re-run: Neo4j can reuse ids of deleted items, and a reused id would be taken as already copied. The script prints Neo4j's counts next to what AGE holds and exits non-zero until they match; relationships whose end nodes were not imported are reported separately, since re-running can't fix those. `IngestedDoc` bookkeeping nodes (and their relationships) are skipped; extraction afterwards recognises the copied passages by their Document vertex and doesn't pay for them again. Before writing, it checks that no two Neo4j labels or relationship types reduce to the same AGE name. Each node gets one AGE label (its first label other than `__Entity__`) and keeps all its Neo4j labels in a `labels` property; `embedding` properties are dropped unless `--keep-property embedding`. `--grant-to` hands the new label tables to the app role so it can keep adding to the graph.
 
 Neither tool deletes anything in Chroma or Neo4j.
 

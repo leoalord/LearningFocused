@@ -27,12 +27,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
-import re
 from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING, Any, Iterable, Iterator
 
+from src.database.age_graph import NAME_KEY, age_name, ensure_label, jsonable as _jsonable, name_lc
 from src.database.pg_store import GRAPH_NAME
 
 if TYPE_CHECKING:
@@ -40,10 +39,10 @@ if TYPE_CHECKING:
 
 DEFAULT_BATCH_SIZE = 1000
 IGNORED_LABELS = {"__Entity__", "__KGBuilder__"}
-# Nodes with these labels are not copied (src/pipeline/index_neo4j.py bookkeeping).
+# Nodes with these labels are not copied: the old Neo4j indexer's bookkeeping, which now
+# lives in the Postgres `ingested_docs` table (src/pipeline/index_graph.py).
 SKIPPED_LABELS = ("IngestedDoc",)
 DEFAULT_DROP_PROPERTIES = ("embedding",)
-NAME_KEY = "name_lc"  # see node_properties; src/database/pg_search.py matches on it
 MAP_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS age_import_map (
     nid text PRIMARY KEY,           -- 'n:<neo4j elementId>' or 'e:<neo4j elementId>'
@@ -78,11 +77,6 @@ class ImportStats:
     labels: dict[str, int] = field(default_factory=dict)
 
 
-def age_name(name: str, fallback: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9_]", "_", name or "").lstrip("_")
-    return cleaned or fallback
-
-
 def primary_label(labels: list[str]) -> str:
     for label in labels:
         if label not in IGNORED_LABELS:
@@ -110,18 +104,6 @@ def name_collisions(labels: Iterable[str], rel_types: Iterable[str]) -> list[str
     return problems
 
 
-def _jsonable(value: Any) -> Any:
-    if isinstance(value, float) and not math.isfinite(value):
-        return None  # agtype has no NaN/Infinity literal
-    if isinstance(value, (list, tuple)):
-        return [_jsonable(v) for v in value]
-    if isinstance(value, dict):
-        return {str(k): _jsonable(v) for k, v in value.items()}
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    return str(value)  # neo4j temporal/spatial types
-
-
 def node_properties(row: NodeRow, drop: Iterable[str]) -> str:
     dropped = set(drop)
     props = {k: _jsonable(v) for k, v in row.props.items() if k not in dropped}
@@ -132,7 +114,7 @@ def node_properties(row: NodeRow, drop: Iterable[str]) -> str:
     # node from breaking toLower() for every query.
     name = props.get("id", props.get("name"))
     if name is not None:
-        props[NAME_KEY] = (name if isinstance(name, str) else json.dumps(name)).lower()
+        props[NAME_KEY] = name_lc(name)
     return json.dumps(props)
 
 
@@ -157,16 +139,7 @@ class AgeWriter:
     def _label(self, name: str, kind: str) -> tuple[int, str]:
         key = (name, kind)
         if key not in self._labels:
-            sql = "SELECT l.id, l.seq_name, l.kind FROM ag_catalog.ag_label l JOIN ag_catalog.ag_graph g ON g.graphid = l.graph WHERE g.name = %s AND l.name = %s"
-            row = self.conn.execute(sql, (self.graph, name)).fetchone()
-            if row is None:
-                create = "create_vlabel" if kind == "v" else "create_elabel"
-                self.conn.execute(f"SELECT ag_catalog.{create}(%s, %s)", (self.graph, name))
-                row = self.conn.execute(sql, (self.graph, name)).fetchone()
-            assert row is not None
-            if row[2] != kind:
-                raise ValueError(f"AGE label {name!r} already exists as kind {row[2]!r}, need {kind!r}")
-            self._labels[key] = (int(row[0]), str(row[1]))
+            self._labels[key] = ensure_label(self.conn, self.graph, name, kind)
         return self._labels[key]
 
     def write_vertices(self, label: str, rows: list[tuple[str, str]]) -> int:

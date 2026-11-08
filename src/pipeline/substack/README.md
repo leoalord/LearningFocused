@@ -13,7 +13,7 @@ This package implements a **text-first ingestion pipeline** for Substack article
   - **Chroma**: Lean indexing by default (2 vectors per article):
     - `article_text` (full article text)
     - `article_summary_overview` (thesis + overview + themes/keywords)
-  - **Neo4j**: Substack article text can be included in graph extraction (via `src.database.neo4j_manager`).
+  - **Graph**: article text goes through LLM graph extraction into the Postgres AGE graph (`src/pipeline/index_graph.py`).
 
 ## Artifacts (where files land)
 
@@ -31,7 +31,7 @@ Configured in `src/config.py`:
 - **`process_all.py`**: Orchestrates ingest + summarization (no DB writes).
 - **`run.py`**: Full runner that calls `process_all` then optionally updates Chroma.
 - **`index_chroma.py`**: Pipeline-owned logic for converting Substack artifacts into `langchain_core.documents.Document` objects.
-- **`index_neo4j.py`**: Pipeline-owned logic for converting Substack artifacts into `Document` objects for graph extraction.
+- **`index_neo4j.py`**: Pipeline-owned logic for converting Substack artifacts into `Document` objects for graph extraction (the name is historical; the graph is in Postgres).
 
 ## How to run
 
@@ -41,10 +41,10 @@ Run the full Substack pipeline (ingest + summaries + Chroma indexing):
 uv run python -m src.pipeline.substack.run -- --mode daily --ingest-limit 10
 ```
 
-Run an end-to-end test (ingest 10 + summarize + Chroma + Neo4j for 10 articles):
+Run an end-to-end test (ingest 10 + summarize + index + graph extraction for 10 articles):
 
 ```bash
-uv run python -m src.pipeline.substack.run --neo4j-article-limit 10 -- --mode daily --ingest-limit 10 --allow-updates
+uv run python -m src.pipeline.substack.run --graph-article-limit 10 -- --mode daily --ingest-limit 10 --allow-updates
 ```
 
 Run processing only (no Chroma indexing):
@@ -59,20 +59,20 @@ Backfill ingest (no limit):
 uv run python -m src.pipeline.substack.process_all -- --mode backfill
 ```
 
-## Neo4j indexing
+## Graph extraction
 
-Substack `run.py` can run Neo4j indexing (articles-only by default). To build/update the full graph (audio + substack docs), run:
+Substack `run.py` runs graph extraction into the Postgres AGE graph (articles only) unless `--skip-graph` (old name `--skip-neo4j` still works). To extract over audio and Substack together:
 
 ```bash
-uv run python -m src.database.neo4j_manager
+uv run python -m src.pipeline.index_graph --max-docs 50
 ```
 
 ## Environment variables
 
 - **`GOOGLE_API_KEY`**: required for summarization (Gemini via `langchain_google_genai`)
 - **`OPENAI_API_KEY`**: required for Chroma embedding (OpenAI embeddings)
-- **Neo4j** (only if you run graph indexing):
-  - `NEO4J_URI`, `NEO4J_USERNAME`, `NEO4J_PASSWORD`
+- **Graph extraction** (unless `--skip-graph`):
+  - `PG_DSN` and an API key for a model in `LF_NEO4J_GRAPH_MODELS` (no Neo4j needed)
   - Optional schema expansion:
     - `NEO4J_SCHEMA_PROFILE=core|extended` (default: `extended`)
     - `NEO4J_ALLOWED_NODES` / `NEO4J_ALLOWED_RELATIONSHIPS` (comma-separated overrides)

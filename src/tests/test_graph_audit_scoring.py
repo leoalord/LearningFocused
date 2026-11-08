@@ -23,7 +23,7 @@ from evals.graph_audit.scoring import (
     score_records,
     strip_extraction_preamble,
 )
-from src.pipeline.index_neo4j import _wrap_for_graph_extraction, build_graph_extraction_spec
+from src.pipeline.index_graph import _wrap_for_graph_extraction, build_graph_extraction_spec
 
 
 def _j(verdict: str = "supported", s_type: str = "correct", o_type: str = "correct",

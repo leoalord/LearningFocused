@@ -50,7 +50,7 @@ _PREAMBLE_HEAD = "You are extracting a knowledge graph"
 def strip_extraction_preamble(text: str) -> str:
     """Remove the extraction instructions the pipeline prepends to Document text.
 
-    `index_neo4j._wrap_for_graph_extraction` writes: spec ("...Rules:\\n...\\n"),
+    `index_graph._wrap_for_graph_extraction` writes: spec ("...Rules:\\n...\\n"),
     a blank line, an optional "Provenance:" block ending in a blank line, then
     the real content. Document nodes store that whole string as `text`.
     """
