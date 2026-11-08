@@ -8,6 +8,11 @@ Measures knowledge-graph extraction quality and separates two failure modes:
   an invented endpoint, a wrong entity type, a wrong predicate or direction, or a
   lost condition.
 
+The audit reads the **served graph in Postgres AGE** (`PG_DSN`), the one the MCP
+server and agents query. Extraction still writes to Neo4j and
+`src/database/neo4j_to_age.py` copies it across, carrying relationship properties
+and every type label (in a `labels` property, since AGE allows one label per node).
+
 A single "approval rate" mixes these up. This tool reports them separately, and
 checks the LLM auditor against blind human labels so you know how far to trust it.
 
@@ -25,6 +30,10 @@ and filters in `src/pipeline/graph_quality.py` so every drop is counted:
 
 Each batch also logs a `schema filter:` line, and the run ends with totals.
 
+The `IngestedDoc` registry stays with extraction (Neo4j today) and is not copied to
+AGE, so drop counts come from the `drops` command. Edge provenance reaches AGE on
+the next `neo4j_to_age` run.
+
 Graphs built before this change have none of these fields. `health` still
 reports graph shape for them, and `sample` falls back to documents that mention
 both endpoints (`provenance: co_mention`), which is weaker evidence.
@@ -32,10 +41,13 @@ both endpoints (`provenance: co_mention`), which is weaker evidence.
 ## Workflow
 
 ```bash
-# 1. Drop rates, off-vocab types, entities with conflicting type labels, edge-type mix
+# 1. Served graph (AGE): entities with conflicting type labels, edge-type mix, provenance coverage
 uv run python -m evals.graph_audit health
 
-# 2. Random sample of entity relationships with source excerpts (read-only Neo4j)
+# 1b. Extraction drop rates and off-vocab types (ingest registry, Neo4j today)
+uv run python -m evals.graph_audit drops
+
+# 2. Random sample of AGE entity relationships with source excerpts (read-only)
 uv run python -m evals.graph_audit sample --n 100
 
 # 3. LLM auditor (billed). Default claude-opus-4-5; override with --models or LF_GRAPH_AUDIT_MODELS
@@ -60,7 +72,7 @@ The auditor judges types against those definitions.
 
 | Metric | Answers |
 | --- | --- |
-| `health`: nodes / relationships kept | Are we throwing away a lot of what the model found? Check the top off-vocab types: they may be types to add to the schema |
+| `drops`: nodes / relationships kept | Are we throwing away a lot of what the model found? Check the top off-vocab types: they may be types to add to the schema |
 | `health`: entities with >1 type label | Mislabeling already in the graph. Entities merge on name, so "X" tagged Person once and Organization once becomes one node with both labels |
 | Auditor primary category | Why rejected claims fail: `hallucinated_endpoint`, `wrong_entity_type`, `bad_identity_link`, `wrong_predicate`, `lost_condition`, `missing_evidence` |
 | By predicate / provenance / extract model | Whether one edge type (often `DISCUSSED`) or one fallback model causes most failures |
