@@ -220,7 +220,7 @@ def status(dsn: str | None = None) -> dict[str, object]:
             )
             extensions = dict(cur.fetchall())
             counts: dict[str, int] = {}
-            for table in ("sources", "documents", "chunks", "ingest_runs"):
+            for table in ("sources", "documents", "chunks", "ingest_runs", "ingested_docs"):
                 cur.execute(f"SELECT count(*) FROM {table}")  # noqa: S608 - fixed table names
                 row = cur.fetchone()
                 counts[table] = int(row[0]) if row else 0

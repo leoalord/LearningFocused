@@ -8,7 +8,12 @@ abort the others. Each source pipeline embeds its new and changed chunks straigh
 into Postgres (src.pipeline.index_pg), where the MCP service reads them live, so the
 job needs PG_DSN. Every run writes a ledger (local + GCS) and rows in ingest_runs /
 source_checks. After ingest, the text artifacts are checksum-synced to the private
-bucket. Neo4j is skipped. Existing files are not re-transcribed.
+bucket. Existing files are not re-transcribed.
+
+LLM graph extraction into the Postgres AGE graph (src.pipeline.index_graph) is billed
+work, so it is off unless `--graph` (or DAILY_GRAPH_EXTRACT=1) turns it on. It then runs
+once after the sources, over every new or changed passage, at most
+`--graph-max-docs` (DAILY_GRAPH_MAX_DOCS, default 100) per run.
 """
 
 from __future__ import annotations
@@ -44,6 +49,7 @@ SOURCE_YOUTUBE = "youtube"
 DEFAULT_ART19_DOWNLOAD_LIMIT = 5
 DEFAULT_SUBSTACK_INGEST_LIMIT = 10
 DEFAULT_YOUTUBE_MAX_NEW = 10
+DEFAULT_GRAPH_MAX_DOCS = 100
 
 SourceRunner = Callable[[], dict[str, Any]]
 
@@ -65,7 +71,7 @@ def run_art19(download_limit: int = DEFAULT_ART19_DOWNLOAD_LIMIT) -> dict[str, A
     from src.pipeline.audio.run import main as audio_main
 
     limit = os.getenv("DAILY_ART19_DOWNLOAD_LIMIT", str(download_limit))
-    argv = ["--skip-neo4j", "--", "--mode", "daily", "--download-limit", str(limit)]
+    argv = ["--skip-graph", "--", "--mode", "daily", "--download-limit", str(limit)]
     print(f"\n=== SOURCE art19 ===\npython -m src.pipeline.audio.run {' '.join(argv)}")
     audio_main(argv)
     return {"argv": argv}
@@ -75,7 +81,7 @@ def run_substack(ingest_limit: int = DEFAULT_SUBSTACK_INGEST_LIMIT) -> dict[str,
     """Substack daily ingest. Skip Neo4j."""
     from src.pipeline.substack.run import main as substack_main
 
-    argv = ["--skip-neo4j", "--", "--mode", "daily", "--ingest-limit", str(ingest_limit)]
+    argv = ["--skip-graph", "--", "--mode", "daily", "--ingest-limit", str(ingest_limit)]
     print(f"\n=== SOURCE substack ===\npython -m src.pipeline.substack.run {' '.join(argv)}")
     substack_main(argv)
     return {"argv": argv}
@@ -106,6 +112,17 @@ FALLBACK_REGISTRY = [
     SourceConfig(key=SOURCE_SUBSTACK, kind="substack", name="Substack", url=SUBSTACK_FEED_URL),
     SourceConfig(key=SOURCE_YOUTUBE, kind="youtube_channel", name="YouTube", url=YOUTUBE_FEED_URL),
 ]
+
+
+def run_graph_extraction(max_docs: int | None) -> dict[str, Any]:
+    """Graph extraction over all audio and Substack passages not extracted yet (billed)."""
+    from src.pipeline.index_graph import update_knowledge_graph
+
+    return update_knowledge_graph(include_audio=True, include_articles=True, max_docs=max_docs).to_dict()
+
+
+def _truthy(value: str | None) -> bool:
+    return (value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _int_config(source: SourceConfig, name: str, default: int) -> int:
@@ -255,12 +272,16 @@ def run(
     dry_run: bool = False,
     source_runners: dict[str, SourceRunner] | None = None,
     registry: list[SourceConfig] | None = None,
+    graph: bool = False,
+    graph_max_docs: int | None = DEFAULT_GRAPH_MAX_DOCS,
+    graph_runner: Callable[[int | None], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Run `sources` (registry keys), or with sources=None every registry source due today.
 
     `source_runners` replaces the registry runners (tests). With PG_DSN set, the registry
     is mirrored to Postgres, weekly sources use their last check from there, and the run
-    is recorded; none of that can fail the run.
+    is recorded; none of that can fail the run. `graph` adds LLM graph extraction after
+    the sources (`graph_runner` replaces it in tests).
     """
     load_dotenv()
     ensure_data_dirs()
@@ -281,6 +302,7 @@ def run(
         "schedule_note": "Cloud Scheduler: 0 8 * * * America/Los_Angeles (learningfocused-ingest-daily)",
         "hydrate": None,
         "sources": {},
+        "graph": None,
         "gcs_sync": None,
         "pg_state": {},
         "errors": [],
@@ -345,6 +367,23 @@ def run(
                 ledger["sources"][name] = _run_isolated(name, fn)
         persist_ledger(ledger, run_id, to_gcs=write_gcs)
 
+    if graph and not dry_run:
+        print("\n----- graph extraction -----")
+        runner = graph_runner or run_graph_extraction
+        step = _run_isolated("graph", lambda: runner(graph_max_docs))
+        detail = step.get("detail") or {}
+        if step.get("ok") and detail.get("ok") is False:
+            step["ok"] = False
+            step["error"] = f"{detail.get('batches_failed')} graph extraction batch(es) failed"
+        if not step.get("ok"):
+            ledger["errors"].append(f"graph: {step.get('error')}")
+        ledger["graph"] = step
+    elif graph:
+        ledger["graph"] = {"ok": True, "dry_run": True}
+    else:
+        ledger["graph"] = {"ok": True, "skipped": True}
+    persist_ledger(ledger, run_id, to_gcs=write_gcs)
+
     if sync and not dry_run:
         try:
             ledger["gcs_sync"] = {"ok": True, "prefixes": upload_artifacts()}
@@ -361,14 +400,15 @@ def run(
 
     sync_ok = bool(ledger.get("gcs_sync") and ledger["gcs_sync"].get("ok"))
     source_ok = all(bool((ledger["sources"].get(n) or {}).get("ok")) for n in wanted)
-    ledger["ok"] = bool(source_ok and sync_ok and (ledger.get("hydrate") or {}).get("ok"))
+    graph_ok = bool((ledger.get("graph") or {}).get("ok"))
+    ledger["ok"] = bool(source_ok and sync_ok and graph_ok and (ledger.get("hydrate") or {}).get("ok"))
     ledger["finished_at"] = _iso(_utc_now())
     if use_pg:
         _pg_step(ledger, "record_run", lambda: feed_state.record_run(ledger))
     persist_ledger(ledger, run_id, to_gcs=write_gcs)
     print(json.dumps({"run_id": run_id, "ok": ledger["ok"], "sources": {
         n: {"ok": (ledger["sources"][n] or {}).get("ok")} for n in wanted
-    }}, indent=2))
+    }, "graph": {"ok": graph_ok}}, indent=2))
     return ledger
 
 
@@ -386,6 +426,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--skip-substack", action="store_true")
     p.add_argument("--skip-youtube", action="store_true")
     p.add_argument("--skip", action="append", default=[], metavar="KEY", help="Skip this registry key (repeatable).")
+    p.add_argument("--graph", action="store_true", default=_truthy(os.getenv("DAILY_GRAPH_EXTRACT")),
+                   help="Also run LLM graph extraction into the Postgres AGE graph (billed; "
+                        "default off, or DAILY_GRAPH_EXTRACT=1).")
+    p.add_argument("--graph-max-docs", type=int,
+                   default=int(os.getenv("DAILY_GRAPH_MAX_DOCS") or DEFAULT_GRAPH_MAX_DOCS),
+                   help="Most new passages sent to the LLM per run (DAILY_GRAPH_MAX_DOCS).")
     return p
 
 
@@ -405,6 +451,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         hydrate=not args.skip_hydrate,
         sync=not args.skip_sync,
         dry_run=args.dry_run,
+        graph=args.graph,
+        graph_max_docs=args.graph_max_docs,
     )
     if args.dry_run:
         return 0

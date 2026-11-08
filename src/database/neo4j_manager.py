@@ -74,10 +74,10 @@ def update_knowledge_graph(
 ):
     """Backwards-compatible wrapper for pipeline indexing.
 
-    Note: graph-extraction orchestration lives in `src/pipeline/index_neo4j.py` so this
-    module can remain a thin DB adapter used by agent tools.
+    Graph extraction now writes to the Postgres AGE graph (`src/pipeline/index_graph.py`),
+    not to Neo4j; this wrapper only forwards to it.
     """
-    from src.pipeline.index_neo4j import update_knowledge_graph as _update
+    from src.pipeline.index_graph import update_knowledge_graph as _update
 
     _update(
         include_audio=include_audio,

@@ -206,6 +206,52 @@ class TestDailyIngestIsolation(unittest.TestCase):
         self.assertFalse(args.skip_art19)
         self.assertTrue(args.dry_run)
 
+    def _run_with_graph(self, **kwargs: object) -> dict:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("src.pipeline.daily_ingest.LEDGER_DIR", Path(tmp)):
+                return run(sources=("substack",), hydrate=False, sync=False,
+                           source_runners={"substack": lambda: {"ingested": 1}}, **kwargs)  # type: ignore[arg-type]
+
+    def test_graph_extraction_is_off_by_default(self) -> None:
+        with patch("src.pipeline.daily_ingest.run_graph_extraction",
+                   side_effect=AssertionError("must not run billed extraction")):
+            ledger = self._run_with_graph()
+        self.assertEqual(ledger["graph"], {"ok": True, "skipped": True})
+
+    def test_graph_extraction_runs_after_sources_when_enabled(self) -> None:
+        calls: list[object] = []
+
+        def graph_runner(max_docs: object) -> dict:
+            calls.append(max_docs)
+            return {"ok": True, "docs_processed": 3}
+
+        ledger = self._run_with_graph(graph=True, graph_max_docs=7, graph_runner=graph_runner)
+        self.assertEqual(calls, [7])
+        self.assertTrue(ledger["graph"]["ok"])
+        self.assertEqual(ledger["graph"]["detail"]["docs_processed"], 3)
+        self.assertTrue(ledger["sources"]["substack"]["ok"])
+
+    def test_graph_failures_fail_the_run_but_not_the_sources(self) -> None:
+        partial = self._run_with_graph(graph=True, graph_runner=lambda _n: {"ok": False, "batches_failed": 2})
+        self.assertFalse(partial["graph"]["ok"])
+        self.assertIn("2 graph extraction batch", partial["graph"]["error"])
+        self.assertFalse(partial["ok"])
+
+        def boom(_n: object) -> dict:
+            raise RuntimeError("PG_DSN is not set")
+
+        crashed = self._run_with_graph(graph=True, graph_runner=boom)
+        self.assertFalse(crashed["graph"]["ok"])
+        self.assertTrue(crashed["sources"]["substack"]["ok"])
+
+    def test_cli_graph_flag_and_env(self) -> None:
+        self.assertFalse(build_parser().parse_args([]).graph)
+        self.assertTrue(build_parser().parse_args(["--graph"]).graph)
+        with patch.dict("os.environ", {"DAILY_GRAPH_EXTRACT": "1", "DAILY_GRAPH_MAX_DOCS": "12"}):
+            args = build_parser().parse_args([])
+        self.assertTrue(args.graph)
+        self.assertEqual(args.graph_max_docs, 12)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -7,7 +7,7 @@ It composes:
 - summary generation: `src.pipeline.audio.generate_summaries`
 - optional indexing:
   - Postgres chunks + pgvector embeddings: `src.pipeline.index_pg.update_pg_index`
-  - Neo4j graph extraction: `src.database.neo4j_manager.update_knowledge_graph`
+  - LLM graph extraction into the Postgres AGE graph: `src.pipeline.index_graph.update_knowledge_graph`
 
 Design:
 - Keep `process_all` thin and incremental/backfill-friendly.
@@ -22,7 +22,6 @@ from typing import Sequence
 from dotenv import load_dotenv
 
 from src.config import COMBINED_DIR, METADATA_DIR, TRANSCRIPTS_DIR, ensure_data_dirs
-from src.pipeline.index_neo4j import update_knowledge_graph, delete_audio_from_neo4j
 from src.pipeline.audio import process_all
 from src.pipeline.audio.generate_summaries import process_combined_summaries
 
@@ -59,34 +58,44 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip updating the Postgres chunks and embeddings.",
     )
     p.add_argument(
+        "--skip-graph",
         "--skip-neo4j",
+        dest="skip_graph",
         action="store_true",
-        help="Skip updating the Neo4j knowledge graph.",
+        help="Skip LLM graph extraction into the Postgres AGE graph (billed LLM work).",
     )
     p.add_argument(
+        "--run-graph-without-new-transcripts",
         "--run-neo4j-without-new-transcripts",
+        dest="run_graph_without_new_transcripts",
         action="store_true",
         help=(
-            "In daily mode, run Neo4j indexing even if this run produced 0 new transcripts. "
-            "By default we skip Neo4j indexing in that case to avoid a full corpus scan."
+            "In daily mode, run graph extraction even if this run produced 0 new transcripts. "
+            "By default we skip it in that case to avoid a full corpus scan."
         ),
     )
     p.add_argument(
+        "--delete-audio-from-graph",
         "--delete-audio-from-neo4j",
+        dest="delete_audio_from_graph",
         action="store_true",
-        help="Delete all audio documents from Neo4j before indexing.",
+        help="Delete all audio Document vertices from the graph (and their bookkeeping) before extracting.",
     )
     p.add_argument(
+        "--graph-schema-profile",
         "--neo4j-schema-profile",
+        dest="graph_schema_profile",
         choices=["core", "extended"],
         default=None,
         help=(
-            "Neo4j relationship schema profile. "
-            "If omitted, uses NEO4J_SCHEMA_PROFILE env var or defaults to 'core'."
+            "Relationship schema profile. "
+            "If omitted, uses NEO4J_SCHEMA_PROFILE env var or defaults to 'extended'."
         ),
     )
     p.add_argument(
+        "--graph-audio-limit",
         "--neo4j-audio-limit",
+        dest="graph_audio_limit",
         type=int,
         default=None,
         help=(
@@ -173,24 +182,26 @@ def main(argv: Sequence[str] | None = None) -> None:
             prune_stale=args.prune_stale,
         )
 
-    if not args.skip_neo4j:
-        if no_new_daily and not args.run_neo4j_without_new_transcripts:
+    if not args.skip_graph:
+        if no_new_daily and not args.run_graph_without_new_transcripts:
             msg = (
-                "No new transcripts were created in this daily run; skipping Neo4j indexing. "
-                "Re-run with --run-neo4j-without-new-transcripts to force a full scan."
+                "No new transcripts were created in this daily run; skipping graph extraction. "
+                "Re-run with --run-graph-without-new-transcripts to force a full scan."
             )
             if process_result and process_result.transcribe_failed:
                 msg += f" (Transcribe failures: {process_result.transcribe_failed})"
             print(msg)
         else:
-            if args.delete_audio_from_neo4j:
-                delete_audio_from_neo4j()
+            from src.pipeline.index_graph import delete_audio_from_graph, update_knowledge_graph
+
+            if args.delete_audio_from_graph:
+                delete_audio_from_graph()
             # Audio runs: keep graph indexing scoped to audio by default.
             update_knowledge_graph(
                 include_audio=True,
                 include_articles=False,
-                audio_limit=args.neo4j_audio_limit,
-                schema_profile=args.neo4j_schema_profile,
+                audio_limit=args.graph_audio_limit,
+                schema_profile=args.graph_schema_profile,
             )
 
 
