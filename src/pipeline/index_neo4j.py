@@ -4,7 +4,14 @@ This module owns:
 - schema constraints (allowed nodes/relationships)
 - graph extraction prompt construction
 - LLM graph transformer invocation
-- writing GraphDocuments to Neo4j
+- schema filtering with drop accounting (`src/pipeline/graph_quality.py`)
+- writing GraphDocuments to Neo4j, with per-edge provenance
+
+Every extracted relationship is stamped (on create) with `source_doc_id` (the
+`Document.id` it came from), `extract_model` and `ingest_run_id`, so audits can
+check an edge against the exact passage that produced it. Each `IngestedDoc`
+record stores raw vs kept node/relationship counts and the off-vocabulary types
+the model proposed.
 
 Pipeline-specific modules own *what to index* (how to construct Documents from artifacts):
 - `src/pipeline/audio/index_neo4j.py`
@@ -19,6 +26,7 @@ from __future__ import annotations
 import logging
 import os
 import hashlib
+from hashlib import md5
 from datetime import datetime, timezone
 import time
 import uuid
@@ -37,6 +45,7 @@ from langchain_neo4j.graphs.graph_document import (
 # LLM selection (primary + fallbacks) for graph extraction
 from src.pipeline.neo4j_llm_config import get_graph_llm_models, get_graph_retry_config
 from src.llm.factory import retryable_invoke, RetryConfig
+from src.pipeline.graph_quality import ExtractionStats, filter_to_schema
 
 # LangSmith tracing (optional at runtime; enabled via env vars).
 try:
@@ -158,6 +167,70 @@ def _mark_ingest_status(*, graph: Neo4jGraph, items: list[_IngestItem], status: 
         d.first_ingested_at = coalesce(d.first_ingested_at, item.ingested_at)
     """
     graph.query(cypher, params=cast(Dict[Any, Any], {"items": items, "status": status}))
+
+
+def _record_extraction_stats(*, graph: Neo4jGraph, rows: list[dict[str, Any]]) -> None:
+    """Store per-document extraction counts on the IngestedDoc registry record."""
+    if not rows:
+        return
+    cypher = """
+    UNWIND $rows AS row
+    MATCH (d:IngestedDoc {source_key: row.source_key, content_hash: row.content_hash})
+    SET d.extract_model = row.extract_model,
+        d.raw_nodes = row.raw_nodes,
+        d.kept_nodes = row.kept_nodes,
+        d.raw_rels = row.raw_rels,
+        d.kept_rels = row.kept_rels,
+        d.rels_dropped_for_endpoint = row.rels_dropped_for_endpoint,
+        d.dropped_node_types = row.dropped_node_types,
+        d.dropped_rel_types = row.dropped_rel_types
+    """
+    graph.query(cypher, params=cast(Dict[Any, Any], {"rows": rows}))
+
+
+def _document_id(source: Document) -> str:
+    """Same id `Neo4jGraph.add_graph_documents` assigns to the Document node."""
+    existing = source.metadata.get("id")
+    if existing:
+        return str(existing)
+    doc_id = md5(source.page_content.encode("utf-8")).hexdigest()
+    source.metadata["id"] = doc_id
+    return doc_id
+
+
+def apply_schema_and_provenance(
+    graph_documents: List[N4jGraphDocument],
+    *,
+    allowed_nodes: list[str],
+    allowed_relationships: list[str],
+    extract_model: str,
+    ingest_run_id: str | None,
+) -> tuple[List[N4jGraphDocument], list[ExtractionStats]]:
+    """Filter each graph document to the schema and stamp edge provenance.
+
+    Returns the filtered documents and one stats object per input document.
+    """
+    out: list[N4jGraphDocument] = []
+    per_doc: list[ExtractionStats] = []
+    for gd in graph_documents:
+        nodes, rels, stats = filter_to_schema(
+            gd.nodes,
+            gd.relationships,
+            allowed_nodes=allowed_nodes,
+            allowed_relationships=allowed_relationships,
+        )
+        source_doc_id = _document_id(gd.source) if gd.source is not None else None
+        for rel in rels:
+            props = dict(rel.properties or {})
+            if source_doc_id:
+                props["source_doc_id"] = source_doc_id
+            props["extract_model"] = extract_model
+            if ingest_run_id:
+                props["ingest_run_id"] = ingest_run_id
+            rel.properties = props
+        out.append(N4jGraphDocument(nodes=nodes, relationships=rels, source=gd.source))
+        per_doc.append(stats)
+    return out, per_doc
 
 
 def _parse_csv_env(name: str) -> list[str] | None:
@@ -315,8 +388,15 @@ def process_and_store(
     llm_transformers: List[LLMGraphTransformer],
     ingest_items: list[_IngestItem],
     retry_cfg: RetryConfig,
-) -> None:
-    """Process documents through LLMGraphTransformer and store in Neo4j."""
+    allowed_nodes: list[str],
+    allowed_relationships: list[str],
+) -> ExtractionStats:
+    """Process documents through LLMGraphTransformer and store in Neo4j.
+
+    Transformers must be built with `strict_mode=False`; schema filtering happens
+    here so drops are counted. Returns totals for the run.
+    """
+    run_stats = ExtractionStats()
     total_docs = len(documents)
     logger.info("Processing %s documents...", total_docs)
 
@@ -336,11 +416,13 @@ def process_and_store(
             # Try transformers in order (primary + fallbacks). Retry each transformer on transient failures.
             graph_documents_raw: List[Any] | None = None
             last_err: Exception | None = None
+            used_model = "unknown-model"
             for transformer in llm_transformers:
                 llm = getattr(transformer, "llm", None)
                 model_name = _model_name_for_llm(llm)
                 try:
                     graph_documents_raw = retryable_invoke(_TransformerRunnable(transformer), batch, retry=retry_cfg)
+                    used_model = model_name
                     logger.info("Batch %s graph transform model=%s", batch_num, model_name)
                     break
                 except Exception as e:
@@ -360,6 +442,19 @@ def process_and_store(
             logger.info("Batch %s LLM transform time: %.2fs", batch_num, t1 - t0)
 
             graph_documents = convert_to_neo4j_graph_documents(graph_documents_raw)
+            run_id = cast(Optional[str], batch[0].metadata.get("ingest_run_id")) if batch else None
+            graph_documents, doc_stats = apply_schema_and_provenance(
+                graph_documents,
+                allowed_nodes=allowed_nodes,
+                allowed_relationships=allowed_relationships,
+                extract_model=used_model,
+                ingest_run_id=run_id,
+            )
+            batch_stats = ExtractionStats()
+            for st in doc_stats:
+                batch_stats.add(st)
+            run_stats.add(batch_stats)
+            logger.info("Batch %s schema filter: %s", batch_num, batch_stats.summary())
             t2 = time.perf_counter()
             if graph_documents:
                 graph.add_graph_documents(graph_documents, baseEntityLabel=True, include_source=True)
@@ -369,8 +464,32 @@ def process_and_store(
 
             # Mark batch as completed even if it produced no graph docs; the LLM work was done.
             _mark_ingest_status(graph=graph, items=batch_items, status="completed")
+            # The transformer returns one graph document per input, in order.
+            if len(doc_stats) == len(batch_items):
+                _record_extraction_stats(
+                    graph=graph,
+                    rows=[
+                        {
+                            "source_key": it.get("source_key"),
+                            "content_hash": it.get("content_hash"),
+                            "extract_model": used_model,
+                            **st.to_record(),
+                        }
+                        for it, st in zip(batch_items, doc_stats)
+                    ],
+                )
+            else:
+                logger.warning(
+                    "Batch %s returned %s graph docs for %s inputs; per-doc stats not recorded",
+                    batch_num,
+                    len(doc_stats),
+                    len(batch_items),
+                )
         except Exception as e:
             logger.error("Error processing batch starting at index %s: %s", i, e)
+
+    logger.info("Run schema filter totals: %s", run_stats.summary(top=10))
+    return run_stats
 
 
 def update_knowledge_graph(
@@ -420,8 +539,14 @@ def update_knowledge_graph(
     docs = [_wrap_for_graph_extraction(d, graph_extraction_spec=graph_spec) for d in docs]
     # Preferred path: build a transformer per model so we can fallback safely.
     llm_models = get_graph_llm_models(temperature=0.0)
+    # strict_mode=False: we filter in apply_schema_and_provenance so drops are counted.
     llm_transformers = [
-        LLMGraphTransformer(llm=cast(Any, m), allowed_nodes=allowed_nodes, allowed_relationships=allowed_relationships)
+        LLMGraphTransformer(
+            llm=cast(Any, m),
+            allowed_nodes=allowed_nodes,
+            allowed_relationships=allowed_relationships,
+            strict_mode=False,
+        )
         for m in llm_models
     ]
     retry_cfg = get_graph_retry_config()
@@ -450,6 +575,8 @@ def update_knowledge_graph(
         llm_transformers=llm_transformers,
         ingest_items=ingest_items,
         retry_cfg=retry_cfg,
+        allowed_nodes=allowed_nodes,
+        allowed_relationships=allowed_relationships,
     )
 
 

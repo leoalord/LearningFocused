@@ -49,3 +49,6 @@ analysis_outputs/
 
 # Generated eval report (shape lives in last_report.example.json)
 evals/last_report.json
+
+# Graph audit samples (hold source excerpts and human labels)
+evals/graph_audit/runs/
