@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 
+from src.pipeline.audio.chunking import normalize_speaker
 from src.pipeline.audio.llm_config import get_speaker_id_llm
 
 # Load environment variables
@@ -55,9 +56,11 @@ def identify_speakers(transcript_path: str) -> Dict[str, str]:
     You are an intelligent assistant tasked with identifying speakers in a podcast transcript.
 
     Context:
-    - The podcast is "The Future of Education" hosted by Mackenzie Price.
-    - Mackenzie Price is the main host.
-    - There is a Narrator who typically provides the intro and outro segments.
+    - The podcast is "The Future of Education" hosted by MacKenzie Price (spelled exactly that way).
+    - MacKenzie Price is the main host.
+    - There is a Narrator who typically provides the intro and outro segments. The line
+      "Welcome to the Future of Education podcast hosted by MacKenzie Price..." is always the
+      Narrator, never a guest, even when a guest's label is attached to it.
     - There may be one or more guests (co-hosts, interviewees, etc.).
     - There are up to 6 speakers.
 
@@ -69,11 +72,12 @@ def identify_speakers(transcript_path: str) -> Dict[str, str]:
 
     Example Output:
     {{
-        "A": "Mackenzie Price",
+        "A": "MacKenzie Price",
         "B": "Narrator",
         "C": "Guest Name"
     }}
 
+    Use each person's name only, with no role suffix like "(Host)".
     Return ONLY valid JSON.
     """
 
@@ -99,6 +103,7 @@ def update_transcript_with_speakers(transcript_path: str, speaker_map: Dict[str,
     with open(transcript_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
+    speaker_map = {label: normalize_speaker(name) for label, name in speaker_map.items()}
     if "meta_data" not in data:
         data["meta_data"] = {}
     data["meta_data"]["speaker_map"] = speaker_map

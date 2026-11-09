@@ -88,3 +88,29 @@ uv run python -m src.pipeline.audio.generate_summaries
 - `transcripts/`: AssemblyAI transcripts (`.json`)
 - `segmented_transcripts/`: topic segments (`*_segmented.json`)
 - `combined_summaries/`: group summaries (`summary_*.json`)
+
+### Chunks (what retrieval and graph extraction see)
+
+Index-time chunks are built from `transcripts/` by `chunking.py`, not copied from the
+topic segments. Topic segments supply the boundaries and the `Topic:` header line:
+
+- text and speaker names come from the transcript (`speaker_name`), with the host's
+  name normalized to "MacKenzie Price" and the "Welcome to the Future of Education
+  podcast hosted by…" intro credited to the Narrator even when diarization merged it
+  into another turn;
+- every utterance is included (the old segments dropped those between LLM timestamps);
+- a topic over 800 tokens is split into even pieces at turn or sentence boundaries,
+  a topic under 150 tokens merges into the next one, and a host question at the end
+  of a chunk moves to the chunk holding its answer;
+- turns over 1,500 words are split at sentences and flagged `long_turn` (diarization
+  returned most of the episode as one turn; in live Q+A episodes the label covers
+  several people);
+- the LLM's generated summary is not embedded.
+
+Chunk ids are `transcript_segment_<episode key>_<start seconds>`. After changing the
+chunker, re-index and prune once; the prune replaces most `transcript_segment` rows,
+so the 10% guard must be lifted for that run:
+
+```bash
+uv run python -m src.pipeline.index_pg --no-articles --prune-stale --max-prune-fraction 1
+```

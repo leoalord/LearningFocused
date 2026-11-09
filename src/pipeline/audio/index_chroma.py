@@ -1,7 +1,7 @@
 """Audio pipeline -> Chroma indexing helpers.
 
 Pipeline-owned logic:
-- how we convert audio artifacts (combined summaries + segmented transcripts) into Documents
+- how we convert audio artifacts (combined summaries + transcripts) into Documents
 
 DB-owned logic lives in `src.database.chroma_manager` (connect/query/add).
 """
@@ -15,7 +15,8 @@ from typing import Any, Dict, List
 
 from langchain_core.documents import Document
 
-from src.config import COMBINED_DIR, SEGMENTED_DIR
+from src.config import COMBINED_DIR, SEGMENTED_DIR, TRANSCRIPTS_DIR
+from src.pipeline.audio.chunking import chunk_header, chunk_transcript
 from src.pipeline.audio.episode_ids import UNKNOWN_EPISODE_ID, episode_key, parse_episode_id
 
 
@@ -99,7 +100,8 @@ def create_summary_documents(summary_data: Dict[str, Any]) -> List[Document]:
 
 
 def create_transcript_documents(transcript_data: Dict[str, Any]) -> List[Document]:
-    """Convert a segmented transcript object into Documents (one per topic segment)."""
+    """One Document per LLM topic segment. Only for segmented files with no raw transcript;
+    `create_transcript_chunk_documents` is the normal path."""
     documents: List[Document] = []
 
     title = transcript_data.get("title", "Unknown Title")
@@ -149,6 +151,82 @@ def create_transcript_documents(transcript_data: Dict[str, Any]) -> List[Documen
     return documents
 
 
+def create_transcript_chunk_documents(
+    transcript_data: Dict[str, Any], segmented_data: Dict[str, Any] | None = None
+) -> List[Document]:
+    """Raw transcript (+ optional LLM topic segments) -> sized, speaker-labelled chunks.
+
+    See `src.pipeline.audio.chunking`. The topic label is a header line and metadata;
+    the generated summary is not embedded.
+    """
+    meta = transcript_data.get("meta_data", {}) or {}
+    title = meta.get("og_file_name") or (segmented_data or {}).get("title") or "Unknown Title"
+    episode_id = parse_episode_id(title)
+    if episode_id == UNKNOWN_EPISODE_ID and segmented_data:
+        episode_id = parse_episode_id(str(segmented_data.get("episode_id") or ""))
+    key = episode_key(episode_id, title)
+    segments = (segmented_data or {}).get("segments", []) or []
+
+    documents: List[Document] = []
+    seen: set[str] = set()
+    for i, chunk in enumerate(chunk_transcript(transcript_data.get("transcript", []) or [], segments)):
+        text = f"{chunk_header(title, chunk)}\n\n{chunk.render()}"
+        chunk_id = f"transcript_segment_{key}_{chunk.start:.2f}"
+        while chunk_id in seen:
+            chunk_id += "+"
+        seen.add(chunk_id)
+        documents.append(
+            Document(
+                page_content=text,
+                metadata={
+                    "type": "transcript_segment",
+                    "episode_id": episode_id,
+                    "title": title,
+                    "topic": chunk.topic or "General",
+                    "topics": " | ".join(chunk.topics),
+                    "speakers": ", ".join(chunk.speakers),
+                    "start_time": chunk.start,
+                    "end_time": chunk.end,
+                    "chunk_index": i,
+                    "long_turn": chunk.long_turn,
+                    "chroma_content_hash": _sha256_text(text),
+                    "_chroma_id": chunk_id,
+                },
+            )
+        )
+    return documents
+
+
+def collect_transcript_chunk_documents(unreadable: List[str] | None = None) -> List[Document]:
+    """Chunks for every raw transcript, joined to its segmented file by name.
+
+    Segmented files without a raw transcript fall back to one chunk per topic segment.
+    """
+    documents: List[Document] = []
+    chunked_stems: set[str] = set()
+    if TRANSCRIPTS_DIR.exists():
+        for path in sorted(TRANSCRIPTS_DIR.glob("*.json")):
+            try:
+                data = _load_json_file(str(path))
+                seg_path = SEGMENTED_DIR / f"{path.stem}_segmented.json"
+                seg = _load_json_file(str(seg_path)) if seg_path.exists() else None
+                documents.extend(create_transcript_chunk_documents(data, seg))
+                chunked_stems.add(path.stem)
+            except Exception as exc:
+                if unreadable is not None:
+                    unreadable.append(f"{path}: {exc}")
+    if SEGMENTED_DIR.exists():
+        for seg_path in sorted(SEGMENTED_DIR.glob("*_segmented.json")):
+            if seg_path.name.removesuffix("_segmented.json") in chunked_stems:
+                continue
+            try:
+                documents.extend(create_transcript_documents(_load_json_file(str(seg_path))))
+            except Exception as exc:
+                if unreadable is not None:
+                    unreadable.append(f"{seg_path}: {exc}")
+    return documents
+
+
 def collect_audio_documents(unreadable: List[str] | None = None) -> List[Document]:
     """Collect all audio-derived Documents for Chroma indexing.
 
@@ -171,18 +249,8 @@ def collect_audio_documents(unreadable: List[str] | None = None) -> List[Documen
                         unreadable.append(f"{path}: {exc}")
                     continue
 
-    # Segmented transcripts
-    if SEGMENTED_DIR.exists():
-        for filename in sorted(os.listdir(SEGMENTED_DIR)):
-            if filename.endswith(".json"):
-                path = os.path.join(SEGMENTED_DIR, filename)
-                try:
-                    data = _load_json_file(path)
-                    documents.extend(create_transcript_documents(data))
-                except Exception as exc:
-                    if unreadable is not None:
-                        unreadable.append(f"{path}: {exc}")
-                    continue
+    # Transcript chunks (raw transcripts, topic labels from segmented files)
+    documents.extend(collect_transcript_chunk_documents(unreadable))
 
     return documents
 
