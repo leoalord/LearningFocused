@@ -37,6 +37,22 @@ def _entity_name(vertex: dict[str, Any]) -> str:
     return str(name) if name is not None else f"<node {vertex.get('id')}>"
 
 
+def _degrees(conn: "psycopg.Connection", graph: str, node_ids: Sequence[int]) -> dict[int, int]:
+    """Edge count per node, read from AGE's edge table directly.
+
+    The Cypher form (`MATCH (n)-[r]-() WHERE id(n) IN $ids`) scans every edge pattern
+    and exceeds the read-only statement timeout on the production graph.
+    """
+    from psycopg import sql
+
+    stmt = sql.SQL(
+        "SELECT nid, count(*) FROM ("
+        "SELECT start_id::text::bigint AS nid FROM {t} UNION ALL SELECT end_id::text::bigint FROM {t}"
+        ") e WHERE nid = ANY(%s) GROUP BY nid"
+    ).format(t=sql.Identifier(graph, "_ag_label_edge"))
+    return {int(nid): int(deg) for nid, deg in conn.execute(stmt, (list(node_ids),)).fetchall()}
+
+
 def graph_shape(conn: "psycopg.Connection", graph: str = pg_store.GRAPH_NAME, top: int = 10) -> dict[str, Any]:
     """Entity type conflicts, relationship mix, and how many edges carry provenance."""
     labels = graph_labels(conn, graph)
@@ -50,13 +66,7 @@ def graph_shape(conn: "psycopg.Connection", graph: str = pg_store.GRAPH_NAME, to
     conflicted = [(nid, v) for nid, v in entities if len(entity_types(v)) > 1]
     examples: list[dict[str, Any]] = []
     if conflicted:
-        degrees = dict(
-            (int(nid), int(deg)) for nid, deg in _cypher(
-                conn, graph,
-                "MATCH (n)-[r]-() WHERE id(n) IN $ids RETURN id(n), count(r)",
-                ["nid", "deg"], {"ids": [int(nid) for nid, _ in conflicted]},
-            )
-        )
+        degrees = _degrees(conn, graph, [int(nid) for nid, _ in conflicted])
         ranked = sorted(conflicted, key=lambda nv: -degrees.get(int(nv[0]), 0))[:top]
         examples = [
             {"name": _entity_name(v), "types": entity_types(v), "degree": degrees.get(int(nid), 0)}
